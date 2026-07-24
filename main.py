@@ -347,6 +347,7 @@ class DocCheckerApp:
                 self.log("Запуск браузера в фоновом (скрытом) режиме...")
                 self.update_status("Запуск браузера...")
 
+                # Оставил headless=False для наглядности процесса
                 browser = p.chromium.launch(headless=True, channel="msedge")
                 context = browser.new_context()
                 page = context.new_page()
@@ -380,94 +381,131 @@ class DocCheckerApp:
                         self.log(f"[{idx + 1}/{total_rows}] Обработка: {fio}")
 
                         variations = get_name_variations(fio)
+
                         student_found = False
                         site_fio = None
+                        best_site_group = None
+                        best_site_faculty = None
 
                         for current_fio in variations:
-                            search_input.fill("")
-                            search_input.fill(current_fio)
+                            if student_found:
+                                break
 
+                            # Очищаем состояние поиска перед началом проверки вариантов
+                            page.goto(BASE_URL)
+                            search_input = page.locator("input[placeholder='Поиск']")
+                            search_input.wait_for(state="visible", timeout=15000)
+
+                            search_input.fill(current_fio)
                             listbox_options = page.locator("div[role='listbox'] div[role='option']")
 
                             try:
-                                listbox_options.first.wait_for(state="visible", timeout=3000)
+                                listbox_options.first.wait_for(state="visible", timeout=5000)
                                 page.wait_for_timeout(1000)
-
                                 options_count = listbox_options.count()
-                                if options_count > 0:
-                                    target_option = listbox_options.nth(options_count - 1)
-                                    raw_text = target_option.inner_text().strip().split('\n')[0]
-
-                                    site_fio = raw_text.split('(')[0].strip()
-
-                                    target_option.click()
-                                    student_found = True
-                                    break
                             except Exception:
+                                options_count = 0
+
+                            if options_count == 0:
                                 continue
 
+                            # Перебираем список вариантов снизу вверх
+                            for opt_idx in range(options_count - 1, -1, -1):
+                                # Обновляем страницу перед проверкой всех элементов, кроме самого первого (нижнего)
+                                if opt_idx < options_count - 1:
+                                    # Принудительно возвращаемся на старт для чистоты данных
+                                    page.goto(BASE_URL)
+                                    search_input = page.locator("input[placeholder='Поиск']")
+                                    search_input.wait_for(state="visible", timeout=15000)
+
+                                    search_input.fill(current_fio)
+                                    listbox_options = page.locator("div[role='listbox'] div[role='option']")
+                                    listbox_options.first.wait_for(state="visible", timeout=5000)
+                                    page.wait_for_timeout(1500)
+
+                                # Защита от изменения длины списка
+                                if opt_idx >= listbox_options.count():
+                                    continue
+
+                                target_option = listbox_options.nth(opt_idx)
+                                raw_text = target_option.inner_text().strip().split('\n')[0]
+                                current_site_fio = raw_text.split('(')[0].strip()
+
+                                target_option.click()
+
+                                try:
+                                    # Ждем появления ФИО как подтверждения загрузки страницы (есть у всех типов аккаунтов)
+                                    page.locator(
+                                        "xpath=//label[contains(text(), 'ФИО')]/following-sibling::input").wait_for(
+                                        state="attached", timeout=5000)
+                                    page.wait_for_timeout(1000)
+                                except Exception:
+                                    pass  # Игнорируем ошибку загрузки, попробуем поискать группу
+
+                                # Безопасно проверяем наличие поля Группа (у сотрудников его нет)
+                                site_group = None
+                                group_xpath = "xpath=//label[contains(text(), 'Группа')]/following-sibling::input"
+                                if page.locator(group_xpath).count() > 0:
+                                    site_group = page.locator(group_xpath).first.input_value().strip()
+
+                                site_faculty = None
+                                if fac_idx is not None:
+                                    faculty_xpath = "xpath=//label[contains(text(), 'Факультет')]/following-sibling::input"
+                                    if page.locator(faculty_xpath).count() > 0:
+                                        site_faculty = page.locator(faculty_xpath).first.input_value().strip()
+
+                                # Умная проверка
+                                is_match = False
+                                if not doc_group:
+                                    is_match = True
+                                elif not use_smart_group:
+                                    if site_group is not None:
+                                        is_match = True
+                                elif site_group and doc_group[0].upper() == site_group[0].upper():
+                                    is_match = True
+
+                                if is_match and site_group is not None:
+                                    student_found = True
+                                    site_fio = current_site_fio
+                                    best_site_group = site_group
+                                    best_site_faculty = site_faculty if site_faculty else ""
+                                    break  # Совпадение найдено, прерываем цикл перебора опций
+                                else:
+                                    disp_group = site_group if site_group else "Отсутствует (Сотрудник)"
+                                    self.log(
+                                        f"  [!] Пропуск профиля: {current_site_fio} ({opt_idx + 1} из {options_count}). Группа [{disp_group}] не подошла.")
+
                         if not student_found:
-                            self.log(f"❌ Варианты для '{fio}' не найдены. Выделяем красным.")
+                            self.log(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.")
                             for paragraph in fio_cell.paragraphs:
                                 for run in paragraph.runs:
                                     run.font.color.rgb = RGBColor(255, 0, 0)
-
-                            page.goto(BASE_URL)
-                            search_input.wait_for(state="visible")
                             continue
 
                         try:
-                            group_xpath = "//label[text()='Группа' or contains(text(), 'Группа')]/following-sibling::input"
-                            page.locator(group_xpath).wait_for(state="attached", timeout=5000)
-                            site_group = page.locator(group_xpath).input_value().strip()
-
-                            site_faculty = None
-                            if fac_idx is not None:
-                                faculty_xpath = "//label[text()='Факультет' or contains(text(), 'Факультет')]/following-sibling::input"
-                                site_faculty = page.locator(faculty_xpath).input_value().strip()
-
-                            # --- Проверки и перезапись данных ---
-
                             # 1. Сверяем ФИО
                             if site_fio and site_fio != fio:
                                 self.log(f"🔄 Обновляем ФИО: {fio} -> {site_fio}")
                                 row.cells[fio_idx].text = site_fio
 
-                            # 2. Сверяем Группу (С учетом «умной» проверки)
-                            if doc_group != site_group:
-                                should_change_group = True
-
-                                # Если в документе пусто, всегда берем значение с сайта без проверок первой буквы
-                                if not doc_group:
-                                    should_change_group = True
-                                elif use_smart_group:
-                                    if site_group and doc_group[0].upper() == site_group[0].upper():
-                                        should_change_group = True
-                                    else:
-                                        should_change_group = False
-                                        self.log(
-                                            f"⚠️ Пропущено изменение группы для {site_fio or fio}. Первая буква не совпала: файл [{doc_group}] vs сайт [{site_group}].")
-
-                                if should_change_group:
-                                    display_doc_group = doc_group if doc_group else "пусто"
-                                    self.log(f"🔄 Обновляем группу: {display_doc_group} -> {site_group}")
-                                    changes_summary.append(
-                                        f"{site_fio or fio}: Группа [{display_doc_group}] ➔ [{site_group}]")
-                                    row.cells[group_idx].text = site_group
-
-                            # 3. Сверяем Факультет
-                            if fac_idx is not None and doc_faculty != site_faculty:
-                                display_doc_faculty = doc_faculty if doc_faculty else "пусто"
-                                self.log(f"🔄 Обновляем факультет: {display_doc_faculty} -> {site_faculty}")
+                            # 2. Обновляем группу
+                            if doc_group != best_site_group:
+                                display_doc_group = doc_group if doc_group else "пусто"
+                                self.log(f"🔄 Обновляем группу: {display_doc_group} -> {best_site_group}")
                                 changes_summary.append(
-                                    f"{site_fio or fio}: Факультет [{display_doc_faculty}] ➔ [{site_faculty}]")
-                                row.cells[fac_idx].text = site_faculty
+                                    f"{site_fio or fio}: Группа [{display_doc_group}] ➔ [{best_site_group}]")
+                                row.cells[group_idx].text = best_site_group
+
+                            # 3. Обновляем факультет
+                            if fac_idx is not None and doc_faculty != best_site_faculty and best_site_faculty:
+                                display_doc_faculty = doc_faculty if doc_faculty else "пусто"
+                                self.log(f"🔄 Обновляем факультет: {display_doc_faculty} -> {best_site_faculty}")
+                                changes_summary.append(
+                                    f"{site_fio or fio}: Факультет [{display_doc_faculty}] ➔ [{best_site_faculty}]")
+                                row.cells[fac_idx].text = best_site_faculty
 
                         except Exception as e:
-                            self.log(f"⚠️ Ошибка при сборе данных {fio}: {e}")
-
-                        page.goto(BASE_URL)
-                        search_input.wait_for(state="visible")
+                            self.log(f"⚠️ Ошибка при записи данных {fio}: {e}")
 
                 finally:
                     browser.close()
@@ -487,6 +525,7 @@ class DocCheckerApp:
 
         except Exception as e:
             self.msg_queue.put({"type": "error", "text": str(e)})
+
 
 
 if __name__ == '__main__':
