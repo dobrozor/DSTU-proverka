@@ -6,12 +6,15 @@ import difflib
 import threading
 import queue
 import datetime
+import re
+import requests
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from docx import Document
 from docx.shared import RGBColor
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
 
 # ==============================================================================
 #  КОНФИГУРАЦИЯ
@@ -31,10 +34,12 @@ DEFAULT_CONFIG = {
     "login": "eselezneva",
     "password": "RZiPbrQA",
     "base_url": "https://edu.donstu.ru/WebApp/#",
-    "browser_channel": "msedge",     # msedge / chrome / chromium
+    "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
     "auto_open_result": True,
-    "fio_similarity_threshold": 0.55  # защита от ложных совпадений похожих ФИО
+    "fio_similarity_threshold": 0.55,  # защита от ложных совпадений похожих ФИО
+    "jwt_token": "",
+    "user_id": ""
 }
 
 
@@ -64,50 +69,25 @@ def save_config(cfg):
 #  СЛОВАРИ / ЭВРИСТИКИ
 # ==============================================================================
 
-# Полный словарь замен для имен (для перебора вариантов написания при поиске)
 NAME_REPLACEMENTS = {
-    "Артем": "Артём",
-    "Aлена": "Алёна",
-    "Федор": "Фёдор",
-    "Эдуарт": "Эдуард",
-    "Семен": "Семён",
-    "Петр": "Пётр",
-    "Наталья": "Наталия",
-    "Софья": "София",
-    "Дарья": "Дария",
-    "Марья": "Мария",
-    "Данил": "Даниил",
-    "Данила": "Даниил",
-    "Кирил": "Кирилл",
-    "Филип": "Филипп",
-    "Генадий": "Геннадий",
-    "Ала": "Алла",
-    "Темур": "Тимур",
-    "Артём": "Артем",
-    "Алёна": "Aлена",
-    "Фёдор": "Федор",
-    "Эдуард": "Эдуарт",
-    "Семён": "Семен",
-    "Пётр": "Петр",
-    "Наталия": "Наталья",
-    "София": "Софья",
-    "Дария": "Дарья",
-    "Мария": "Марья",
-    "Даниил": "Данил",
-    "Кирилл": "Кирил",
-    "Филипп": "Филип",
-    "Геннадий": "Генадий",
-    "Алла": "Ала",
+    "Артем": "Артём", "Aлена": "Алёна", "Федор": "Фёдор", "Эдуарт": "Эдуард",
+    "Семен": "Семён", "Петр": "Пётр", "Наталья": "Наталия", "Софья": "София",
+    "Дарья": "Дария", "Марья": "Мария", "Данил": "Даниил", "Данила": "Даниил",
+    "Кирил": "Кирилл", "Филип": "Филипп", "Генадий": "Геннадий", "Ала": "Алла",
+    "Темур": "Тимур", "Артём": "Артем", "Алёна": "Aлена", "Фёдор": "Федор",
+    "Эдуард": "Эдуарт", "Семён": "Семен", "Пётр": "Петр", "Наталия": "Наталья",
+    "София": "Софья", "Дария": "Дарья", "Мария": "Марья", "Даниил": "Данил",
+    "Кирилл": "Кирил", "Филипп": "Филип", "Геннадий": "Генадий", "Алла": "Ала",
     "Тимур": "Темур"
 }
 
-# Словарь для поиска колонок в Word и соответствующих им лейблов на сайте
 SITE_LABELS_MAPPING = {
     'фио': 'ФИО',
     'ф.и.о': 'ФИО',
     'групп': 'Группа',
     'курс': 'Курс',
     'зачетн': 'Номер зачетной книжки',
+    'зачетка': 'Номер зачетной книжки',
     'зачётн': 'Номер зачетной книжки',
     'факультет': 'Факультет',
     'кафедр': 'Кафедра',
@@ -128,36 +108,17 @@ def get_name_variations(fio):
 
 
 def normalize_group(group):
-    """Нормализует запись группы для сравнения: убирает пробелы/дефисы, верхний регистр."""
     if not group:
         return ""
     return "".join(ch for ch in group.upper() if ch.isalnum())
 
 
 def fio_similarity(a, b):
-    """Коэффициент схожести двух ФИО (0..1), защита от ложных совпадений в поиске."""
     a = (a or "").strip().lower()
     b = (b or "").strip().lower()
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def retry(times=2, delay=0.6, exceptions=(PWTimeoutError, Exception)):
-    """Простой декоратор ретраев для нестабильных сетевых операций."""
-    def decorator(fn):
-        def wrapper(*args, **kwargs):
-            last_exc = None
-            for attempt in range(times + 1):
-                try:
-                    return fn(*args, **kwargs)
-                except exceptions as e:
-                    last_exc = e
-                    if attempt < times:
-                        time.sleep(delay)
-            raise last_exc
-        return wrapper
-    return decorator
 
 
 # ==============================================================================
@@ -167,7 +128,7 @@ def retry(times=2, delay=0.6, exceptions=(PWTimeoutError, Exception)):
 class DocCheckerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Автоматизация проверки студентов ДОНСТУ")
+        self.root.title("Автоматизация проверки студентов ДГТУ")
         self.root.geometry("700x760")
         self.root.minsize(620, 620)
         self.root.configure(padx=25, pady=20, bg="#FFFFFF")
@@ -187,8 +148,8 @@ class DocCheckerApp:
         self.style = ttk.Style()
         self.style.theme_use('clam')
         self.style.configure("Orange.Horizontal.TProgressbar",
-                              troughcolor='#F5F5F5', background='#FF6F00',
-                              bordercolor='#FFFFFF', lightcolor='#FF6F00', darkcolor='#FF6F00')
+                             troughcolor='#F5F5F5', background='#FF6F00',
+                             bordercolor='#FFFFFF', lightcolor='#FF6F00', darkcolor='#FF6F00')
 
         self._build_menu()
         self._build_ui()
@@ -201,6 +162,7 @@ class DocCheckerApp:
         menubar = tk.Menu(self.root)
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Настройки подключения...", command=self.open_settings)
+        settings_menu.add_command(label="Сбросить авторизацию (Удалить JWT)", command=self.reset_auth)
         settings_menu.add_command(label="Открыть папку логов", command=self.open_logs_folder)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
 
@@ -211,11 +173,11 @@ class DocCheckerApp:
 
     def _build_ui(self):
         self.lbl_title = tk.Label(self.root, text="Проверка списков ДГТУ", font=("Segoe UI", 18, "bold"),
-                                   bg="#FFFFFF", fg="#212121")
+                                  bg="#FFFFFF", fg="#212121")
         self.lbl_title.pack(anchor=tk.W, pady=(0, 2))
 
-        self.lbl_subtitle = tk.Label(self.root, text="Выберите документ .docx для запуска сверки с базой данных",
-                                      font=("Segoe UI", 10), bg="#FFFFFF", fg="#757575")
+        self.lbl_subtitle = tk.Label(self.root, text="Выберите документ .docx для запуска сверки с базой данных (API)",
+                                     font=("Segoe UI", 10), bg="#FFFFFF", fg="#757575")
         self.lbl_subtitle.pack(anchor=tk.W, pady=(0, 20))
 
         # --- Выбор файла ---
@@ -223,13 +185,13 @@ class DocCheckerApp:
         self.frame_file.pack(fill=tk.X, pady=5)
 
         self.btn_select = tk.Button(self.frame_file, text="Выбрать файл", command=self.select_file, width=15,
-                                     font=("Segoe UI", 10, "bold"), bg="#333333", fg="#FFFFFF",
-                                     activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0,
-                                     pady=5, cursor="hand2")
+                                    font=("Segoe UI", 10, "bold"), bg="#333333", fg="#FFFFFF",
+                                    activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0,
+                                    pady=5, cursor="hand2")
         self.btn_select.pack(side=tk.LEFT, padx=(0, 15))
 
         self.lbl_file_name = tk.Label(self.frame_file, text="Файл не выбран", font=("Segoe UI", 10, "italic"),
-                                       bg="#FFFFFF", fg="#9E9E9E")
+                                      bg="#FFFFFF", fg="#9E9E9E")
         self.lbl_file_name.pack(side=tk.LEFT, fill=tk.X)
 
         # --- Опции ---
@@ -238,7 +200,7 @@ class DocCheckerApp:
 
         self.smart_group_var = tk.BooleanVar(value=False)
         self.chk_smart_group = tk.Checkbutton(
-            self.frame_options, text="Умная замена группы (проверять совпадение первой буквы)",
+            self.frame_options, text="Умная замена группы (проверять совпадение первых двух символов)",
             variable=self.smart_group_var, font=("Segoe UI", 10), bg="#FFFFFF", fg="#333333",
             activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
         )
@@ -246,7 +208,7 @@ class DocCheckerApp:
 
         self.headless_var = tk.BooleanVar(value=self.config_data.get("headless", False))
         self.chk_headless = tk.Checkbutton(
-            self.frame_options, text="Фоновый режим (без окна браузера — быстрее)",
+            self.frame_options, text="Фоновый режим авторизации (без окна браузера)",
             variable=self.headless_var, font=("Segoe UI", 10), bg="#FFFFFF", fg="#333333",
             activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
         )
@@ -265,30 +227,30 @@ class DocCheckerApp:
         self.frame_buttons.pack(fill=tk.X, pady=15)
 
         self.btn_start = tk.Button(self.frame_buttons, text="Начать сверку", bg="#FF6F00", fg="#FFFFFF",
-                                    font=("Segoe UI", 12, "bold"), command=self.start_processing, state=tk.DISABLED,
-                                    activebackground="#E65C00", activeforeground="#FFFFFF", relief="flat", bd=0,
-                                    pady=7, cursor="hand2")
+                                   font=("Segoe UI", 12, "bold"), command=self.start_processing, state=tk.DISABLED,
+                                   activebackground="#E65C00", activeforeground="#FFFFFF", relief="flat", bd=0,
+                                   pady=7, cursor="hand2")
         self.btn_start.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
 
         self.btn_stop = tk.Button(self.frame_buttons, text="Стоп", bg="#B00020", fg="#FFFFFF",
-                                   font=("Segoe UI", 12, "bold"), command=self.stop_processing, state=tk.DISABLED,
-                                   activebackground="#8E001A", activeforeground="#FFFFFF", relief="flat", bd=0,
-                                   pady=7, cursor="hand2")
+                                  font=("Segoe UI", 12, "bold"), command=self.stop_processing, state=tk.DISABLED,
+                                  activebackground="#8E001A", activeforeground="#FFFFFF", relief="flat", bd=0,
+                                  pady=7, cursor="hand2")
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
 
         self.btn_show_last = tk.Button(self.frame_buttons, text="Показать прошлый отчет", bg="#333333", fg="#FFFFFF",
-                                        font=("Segoe UI", 12, "bold"), command=self.reopen_summary, state=tk.DISABLED,
-                                        activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0,
-                                        pady=7, cursor="hand2")
+                                       font=("Segoe UI", 12, "bold"), command=self.reopen_summary, state=tk.DISABLED,
+                                       activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0,
+                                       pady=7, cursor="hand2")
         self.btn_show_last.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # --- Прогресс ---
         self.progress = ttk.Progressbar(self.root, orient=tk.HORIZONTAL, mode='determinate',
-                                         style="Orange.Horizontal.TProgressbar")
+                                        style="Orange.Horizontal.TProgressbar")
         self.progress.pack(fill=tk.X, pady=(0, 8))
 
         self.lbl_status = tk.Label(self.root, text="Ожидание запуска...", font=("Segoe UI", 10, "bold"),
-                                    bg="#FFFFFF", fg="#FF6F00")
+                                   bg="#FFFFFF", fg="#FF6F00")
         self.lbl_status.pack(anchor=tk.W)
 
         self.lbl_stats = tk.Label(self.root, text="", font=("Segoe UI", 9), bg="#FFFFFF", fg="#757575")
@@ -296,8 +258,8 @@ class DocCheckerApp:
 
         # --- Лог ---
         self.log_text = tk.Text(self.root, height=12, bg="#F9F9F9", fg="#333333", font=("Courier New", 10),
-                                 relief="flat", bd=1, highlightbackground="#E0E0E0", highlightcolor="#FF6F00",
-                                 highlightthickness=1, padx=10, pady=10, state=tk.DISABLED, wrap=tk.WORD)
+                                relief="flat", bd=1, highlightbackground="#E0E0E0", highlightcolor="#FF6F00",
+                                highlightthickness=1, padx=10, pady=10, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.tag_configure("error", foreground="#B00020")
         self.log_text.tag_configure("warn", foreground="#E65C00")
@@ -305,12 +267,13 @@ class DocCheckerApp:
         self.log_text.tag_configure("muted", foreground="#9E9E9E")
 
         info_text = (
-            "• Скрипт автоматически найдет колонки (Зачетная книжка, Курс и др.) и заполнит пустые поля.\n"
-            "• Если у студента несколько профилей (бакалавр/магистр), данные впишутся через запятую.\n"
-            "• Не найденные студенты выделяются красным, обновлённые поля — зелёным."
+            "• Автоматизированная проверка по списку студентов ДГТУ. Требуется аккаунт с правами доступа к поиску студентов на едушке.\n"
+            "• Для подробной информации советую прочитать 'Справка' вверху программы\n"
+            "\n"
+            "• Скрипт создан с любовью к вашему личному времени.\n"
         )
         self.lbl_info = tk.Label(self.root, text=info_text, justify=tk.LEFT, bg="#FFFFFF", fg="#757575",
-                                  font=("Segoe UI", 9), anchor=tk.W)
+                                 font=("Segoe UI", 9), anchor=tk.W)
         self.lbl_info.pack(fill=tk.X, pady=(15, 0))
 
     # ---------------------------------------------------------- Настройки --
@@ -339,7 +302,7 @@ class DocCheckerApp:
             .pack(anchor=tk.W, pady=(8, 2))
         channel_var = tk.StringVar(value=self.config_data.get("browser_channel", "msedge"))
         channel_combo = ttk.Combobox(win, textvariable=channel_var, state="readonly",
-                                      values=["msedge", "chrome", "chromium"])
+                                     values=["msedge", "chrome", "chromium"])
         channel_combo.pack(fill=tk.X)
 
         def do_save():
@@ -352,8 +315,14 @@ class DocCheckerApp:
             win.destroy()
 
         btn_save = tk.Button(win, text="Сохранить", command=do_save, bg="#FF6F00", fg="#FFFFFF",
-                              font=("Segoe UI", 10, "bold"), relief="flat", bd=0, pady=6, cursor="hand2")
+                             font=("Segoe UI", 10, "bold"), relief="flat", bd=0, pady=6, cursor="hand2")
         btn_save.pack(fill=tk.X, pady=(20, 0))
+
+    def reset_auth(self):
+        self.config_data["jwt_token"] = ""
+        self.config_data["user_id"] = ""
+        save_config(self.config_data)
+        messagebox.showinfo("Готово", "Токен успешно удален. При следующей проверке авторизация будет пройдена заново.")
 
     def open_logs_folder(self):
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -368,19 +337,36 @@ class DocCheckerApp:
             pass
 
     def show_about(self):
-        messagebox.showinfo(
-            "О программе",
-            "Автоматизация проверки студентов ДОНСТУ\n\n"
-            "Сверяет данные из Word-документа с внутренней базой edu.donstu.ru "
-            "и дозаполняет отсутствующие поля."
+        about_text = (
+            "Автоматизация проверки студентов ДГТУ\n\n"
+            "Программа сверяет данные из Word-документа с базой edu.donstu.ru и "
+            "автоматически дозаполняет пустые ячейки.\n\n"
+            "КАК ДОЛЖНЫ НАЗЫВАТЬСЯ КОЛОНКИ В WORD:\n"
+            "Скрипт ищет колонки по ключевым словам. Регистр букв, пробелы и точки игнорируются, "
+            "поэтому точное совпадение не требуется (главное — наличие корня слова):\n\n"
+            "• ФИО (обязательно) — ищет по «ФИО» или «Ф.И.О.»\n"
+            "• Группа — ищет группу студента (В шапке: Группа, Группы)\n"
+            "• Курс — ищет по курсу студента\n"
+            "• Номер зачетной книжки — ищет номер зачетки\n"
+            "• Факультет — ищет по «факультету»\n"
+            "• Кафедра — ищет по «кафедре»\n"
+            "• Дата рождения — ищет по «датарожд» (например: Дата рождения)\n"
+            "• Год поступления — ищет по «годпоступл» (например: Год поступления)\n"
+            "• Гражданство — ищет по «гражданств»\n\n"
+            "КАКИЕ ДАННЫЕ ПАРСЯТСЯ ИЗ API:\n"
+            "Из карточки студента извлекаются: ФИО, номер зачетки, группа, "
+            "кафедра, факультет, курс, год поступления, дата рождения и гражданство (национальность). "
+            "Если данные (например, дата рождения) скрыты настройками приватности профиля, "
+            "скрипт корректно их пропустит и оставит ячейку пустой."
         )
+        messagebox.showinfo("О программе и форматах колонок", about_text)
 
     # ------------------------------------------------------------ Работа --
 
     def select_file(self):
         initial_dir = self.config_data.get("last_dir", os.path.expanduser("~"))
         file_path = filedialog.askopenfilename(title="Выберите документ", initialdir=initial_dir,
-                                                 filetypes=[("Word Documents", "*.docx")])
+                                               filetypes=[("Word Documents", "*.docx")])
         if file_path:
             self.file_path = file_path
             self.config_data["last_dir"] = os.path.dirname(file_path)
@@ -431,7 +417,6 @@ class DocCheckerApp:
                     self.last_changes = msg["changes"]
                     self.last_file_path = msg["path"]
                     self.btn_show_last.config(state=tk.NORMAL)
-                    self.show_summary_window(msg["changes"], msg["path"], cancelled=msg.get("cancelled", False))
                     self.btn_select.config(state=tk.NORMAL)
                     self.btn_start.config(state=tk.NORMAL)
                     self.btn_stop.config(state=tk.DISABLED)
@@ -473,7 +458,7 @@ class DocCheckerApp:
         text_frame.pack(fill=tk.BOTH, expand=True)
 
         text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Courier New", 10), bg="#F9F9F9", fg="#333333",
-                             relief="flat", bd=1, highlightbackground="#E0E0E0", highlightthickness=1, padx=8, pady=8)
+                            relief="flat", bd=1, highlightbackground="#E0E0E0", highlightthickness=1, padx=8, pady=8)
         scrollbar = tk.Scrollbar(text_frame, command=text_area.yview)
         text_area.config(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -487,7 +472,7 @@ class DocCheckerApp:
         text_area.config(state=tk.DISABLED)
 
         lbl_file = tk.Label(summary_win, text=f"Файл успешно сохранен как:\n{os.path.basename(file_path)}",
-                             fg="#FF6F00", justify=tk.LEFT, bg="#FFFFFF", font=("Segoe UI", 10, "bold"))
+                            fg="#FF6F00", justify=tk.LEFT, bg="#FFFFFF", font=("Segoe UI", 10, "bold"))
         lbl_file.pack(anchor=tk.W, pady=(15, 0))
 
         btn_frame = tk.Frame(summary_win, bg="#FFFFFF")
@@ -509,21 +494,21 @@ class DocCheckerApp:
                 messagebox.showinfo("Готово", "Отчёт сохранён.")
 
         btn_export = tk.Button(btn_frame, text="Экспорт отчёта", command=export_report, width=15,
-                                font=("Segoe UI", 10, "bold"), bg="#333333", fg="#FFFFFF",
-                                activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0, pady=5,
-                                cursor="hand2")
-        btn_export.pack(side=tk.LEFT)
-
-        btn_open = tk.Button(btn_frame, text="Открыть файл", command=lambda: self._open_file(file_path), width=15,
-                              font=("Segoe UI", 10, "bold"), bg="#FF6F00", fg="#FFFFFF",
-                              activebackground="#E65C00", activeforeground="#FFFFFF", relief="flat", bd=0, pady=5,
-                              cursor="hand2")
-        btn_open.pack(side=tk.LEFT, padx=(10, 0))
-
-        btn_close = tk.Button(btn_frame, text="Закрыть", command=summary_win.destroy, width=15,
                                font=("Segoe UI", 10, "bold"), bg="#333333", fg="#FFFFFF",
                                activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0, pady=5,
                                cursor="hand2")
+        btn_export.pack(side=tk.LEFT)
+
+        btn_open = tk.Button(btn_frame, text="Открыть файл", command=lambda: self._open_file(file_path), width=15,
+                             font=("Segoe UI", 10, "bold"), bg="#FF6F00", fg="#FFFFFF",
+                             activebackground="#E65C00", activeforeground="#FFFFFF", relief="flat", bd=0, pady=5,
+                             cursor="hand2")
+        btn_open.pack(side=tk.LEFT, padx=(10, 0))
+
+        btn_close = tk.Button(btn_frame, text="Закрыть", command=summary_win.destroy, width=15,
+                              font=("Segoe UI", 10, "bold"), bg="#333333", fg="#FFFFFF",
+                              activebackground="#444444", activeforeground="#FFFFFF", relief="flat", bd=0, pady=5,
+                              cursor="hand2")
         btn_close.pack(side=tk.RIGHT)
 
     def reopen_summary(self):
@@ -557,16 +542,135 @@ class DocCheckerApp:
         self.log_text.config(state=tk.DISABLED)
 
         self.progress["value"] = 0
-        self.update_status("Инициализация браузера...", 0)
+        self.update_status("Инициализация...", 0)
 
         threading.Thread(target=self.process_file_worker,
-                          args=(self.file_path, use_smart_group, headless), daemon=True).start()
+                         args=(self.file_path, use_smart_group, headless), daemon=True).start()
 
     def stop_processing(self):
         if self.is_running:
             self.cancel_event.set()
             self.btn_stop.config(state=tk.DISABLED)
             self.log("⏹ Получен сигнал остановки — завершаем текущего студента и сохраняем файл...", "warn")
+
+    # ---------------------------------------------------- Работа с API --
+
+    def fetch_student_api(self, fio, token, user_id):
+        headers = {
+            "authorization": f"Bearer {token}",
+            "accept": "application/json",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/150.0.0.0 Safari/537.36",
+        }
+        if user_id:
+            headers["user-id"] = str(user_id)
+
+        try:
+            search_url = "https://edu.donstu.ru/api/search"
+            search_resp = requests.get(search_url, params={"searchQuery": fio}, headers=headers, timeout=10)
+            if not search_resp.ok:
+                return []
+            results = search_resp.json().get("data", {}).get("results", [])
+        except Exception:
+            return []
+
+        student_ids = []
+        for item in results:
+            if item.get("type") == "Студент":
+                match = re.search(r"-\d+", item.get("link", ""))
+                if match:
+                    student_ids.append(match.group(0))
+                elif item.get("objectID"):
+                    student_ids.append(f"-{item['objectID']}")
+
+        students_data = []
+        user_info_url = "https://edu.donstu.ru/api/UserInfo/Student"
+
+        for sid in student_ids:
+            if self.cancel_event.is_set():
+                break
+
+            user_headers = headers.copy()
+            user_headers["current-path"] = f"https://edu.donstu.ru/WebApp/#/PersonalKab/{sid}"
+            try:
+                info_resp = requests.get(user_info_url, params={"studentID": sid}, headers=user_headers, timeout=10)
+                if info_resp.ok:
+                    data = info_resp.json().get("data", {})
+
+                    # Обрабатываем поля, которые могут быть скрыты настройками приватности API
+                    birthday_val = str(data.get("birthday") or "")
+                    if "скрыто" in birthday_val.lower():
+                        birthday_val = ""
+
+                    nationality_val = str(data.get("nationality") or "")
+                    if "скрыто" in nationality_val.lower():
+                        nationality_val = ""
+
+                    students_data.append({
+                        "ФИО": data.get("fullName") or "",
+                        "Номер зачетной книжки": data.get("numRecordBook") or "",
+                        "Группа": (data.get("group") or {}).get("item1") or "",
+                        "Кафедра": (data.get("kaf") or {}).get("kafName") or "",
+                        "Факультет": (data.get("facul") or {}).get("faculName") or "",
+                        "Курс": str(data.get("course") or ""),
+                        "Год поступления": str(data.get("admissionYear") or ""),
+                        "Дата рождения": birthday_val,
+                        "Гражданство": nationality_val
+                    })
+            except Exception:
+                continue
+
+        return students_data
+
+    def get_new_token_via_browser(self, headless):
+        cfg = self.config_data
+        base_url = cfg.get("base_url")
+        login = cfg.get("login")
+        password = cfg.get("password")
+        browser_channel = cfg.get("browser_channel", "msedge")
+
+        extracted_token = None
+        extracted_user_id = None
+
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=headless, channel=browser_channel, args=["--no-proxy-server"])
+            except Exception:
+                browser = p.chromium.launch(headless=headless, args=["--no-proxy-server"])
+
+            context = browser.new_context()
+            page = context.new_page()
+
+            def on_request(request):
+                nonlocal extracted_token, extracted_user_id
+                if "/api/" in request.url:
+                    auth = request.headers.get("authorization", "")
+                    if "Bearer " in auth:
+                        extracted_token = auth.split("Bearer ")[1]
+                    uid = request.headers.get("user-id")
+                    if uid:
+                        extracted_user_id = uid
+
+            page.on("request", on_request)
+
+            try:
+                page.goto(base_url)
+                page.locator('input[name="login"]').fill(login)
+                page.locator('input[name="password"]').fill(password)
+                page.locator('input[name="password"]').press("Enter")
+
+                search_input = page.locator("input[placeholder='Поиск']")
+                search_input.wait_for(state="visible", timeout=15000)
+
+                # Делаем фиктивный ввод, чтобы гарантированно триггернуть API запрос поиска
+                if not extracted_token:
+                    search_input.fill("т")
+                    page.wait_for_timeout(2000)
+            except Exception:
+                pass
+            finally:
+                browser.close()
+
+        return extracted_token, extracted_user_id
 
     # -------------------------------------------------------- Обработка --
 
@@ -603,7 +707,6 @@ class DocCheckerApp:
                     {"type": "error", "text": "В документе не найдена таблица со списком студентов (нет колонки ФИО)."})
                 return
 
-            # Динамическое определение колонок
             doc_columns = {}
             for i, h in enumerate(headers):
                 h_clean = h.replace(" ", "").replace(".", "")
@@ -617,236 +720,168 @@ class DocCheckerApp:
                 return
 
             log_both(f"Найдены колонки: {', '.join(doc_columns.keys())}")
-
             total_rows = len(target_table.rows) - 1
             changes_summary = []
 
-            cfg = self.config_data
-            base_url = cfg.get("base_url", DEFAULT_CONFIG["base_url"])
-            browser_channel = cfg.get("browser_channel", "msedge")
-            similarity_threshold = cfg.get("fio_similarity_threshold", 0.55)
+            # ---- ПРОВЕРКА / ПОЛУЧЕНИЕ JWT ----
+            jwt_token = self.config_data.get("jwt_token")
+            user_id = self.config_data.get("user_id")
+            token_valid = False
 
-            with sync_playwright() as p:
-                log_both("Запуск браузера...")
-                self.update_status("Запуск браузера...", 0)
-
+            if jwt_token:
+                log_both("Проверка сохраненного токена API...")
                 try:
-                    browser = p.chromium.launch(headless=headless, channel=browser_channel,
-                                                 args=["--no-proxy-server"])
+                    test_r = requests.get(
+                        "https://edu.donstu.ru/api/search",
+                        params={"searchQuery": "тест"},
+                        headers={"authorization": f"Bearer {jwt_token}", "accept": "application/json"},
+                        timeout=5
+                    )
+                    if test_r.status_code == 200:
+                        token_valid = True
+                        log_both("Сохраненный токен действителен.", "success")
+                except Exception:
+                    pass
+
+            if not token_valid:
+                log_both("Токен устарел или отсутствует. Запуск браузера для авторизации...", "warn")
+                self.update_status("Авторизация через браузер...", 0)
+                try:
+                    new_token, new_uid = self.get_new_token_via_browser(headless)
+                    if new_token:
+                        jwt_token = new_token
+                        user_id = new_uid
+                        self.config_data["jwt_token"] = jwt_token
+                        self.config_data["user_id"] = user_id
+                        save_config(self.config_data)
+                        log_both("Новый токен успешно получен и сохранён.", "success")
+                    else:
+                        self.msg_queue.put({"type": "error", "text": "Не удалось получить токен при авторизации."})
+                        return
                 except Exception as e:
-                    log_both(f"⚠️ Не удалось запустить браузер '{browser_channel}' ({e}). Пробуем встроенный Chromium.",
-                              "warn")
-                    browser = p.chromium.launch(headless=headless, args=["--no-proxy-server"])
+                    self.msg_queue.put({"type": "error", "text": f"Ошибка авторизации: {e}"})
+                    return
 
-                context = browser.new_context()
-                page = context.new_page()
+            # ---- ОСНОВНОЙ ЦИКЛ ПО ТАБЛИЦЕ ----
+            for idx, row in enumerate(target_table.rows[1:]):
+                if self.cancel_event.is_set():
+                    cancelled = True
+                    log_both("⏹ Остановлено пользователем перед следующим студентом.", "warn")
+                    break
 
-                @retry(times=2, delay=0.6)
-                def goto_search():
-                    page.goto(base_url)
-                    search_input = page.locator("input[placeholder='Поиск']")
-                    search_input.wait_for(state="visible", timeout=15000)
-                    return search_input
+                row_data = {}
+                for label, col_idx in doc_columns.items():
+                    if col_idx < len(row.cells):
+                        row_data[label] = row.cells[col_idx].text.strip()
+                    else:
+                        row_data[label] = ""
+
+                fio = row_data.get('ФИО', "")
+                doc_group = row_data.get('Группа', "")
+
+                if not fio or fio == doc_group:
+                    continue
+
+                self.stats["processed"] += 1
+                percent = int(((idx + 1) / total_rows) * 100)
+                self.update_status(f"Обработка: {idx + 1} из {total_rows} ({fio})", percent)
+                log_both("-" * 40)
+                log_both(f"[{idx + 1}/{total_rows}] Обработка: {fio}")
+
+                variations = get_name_variations(fio)
+                student_found = False
+                aggregated_site_data = {label: [] for label in doc_columns.keys()}
 
                 try:
-                    page.goto(base_url)
-                    page.locator('input[name="login"]').fill(cfg.get("login", ""))
-                    page.locator('input[name="password"]').fill(cfg.get("password", ""))
-                    page.locator('input[name="password"]').press("Enter")
-
-                    search_input = page.locator("input[placeholder='Поиск']")
-                    search_input.wait_for(state="visible", timeout=15000)
-                    log_both("Авторизация успешна. Начинаем сверку.", "success")
-
-                    for idx, row in enumerate(target_table.rows[1:]):
-                        if self.cancel_event.is_set():
-                            cancelled = True
-                            log_both("⏹ Остановлено пользователем перед следующим студентом.", "warn")
+                    for current_fio in variations:
+                        if student_found or self.cancel_event.is_set():
                             break
 
-                        row_data = {}
-                        for label, col_idx in doc_columns.items():
-                            if col_idx < len(row.cells):
-                                row_data[label] = row.cells[col_idx].text.strip()
+                        api_students = self.fetch_student_api(current_fio, jwt_token, user_id)
+
+                        for s_data in api_students:
+                            current_site_fio = s_data.get('ФИО', "")
+                            if not current_site_fio:
+                                continue
+
+                            sim = fio_similarity(fio, current_site_fio)
+                            if sim < self.config_data.get("fio_similarity_threshold", 0.55):
+                                log_both(f"  [!] Пропуск: {current_site_fio}. Схожесть ({sim:.2f}).", "warn")
+                                continue
+
+                            site_group = s_data.get('Группа', "")
+                            is_match = False
+
+                            if not doc_group:
+                                is_match = True
+                            elif not use_smart_group:
+                                if site_group:
+                                    is_match = True
+                            elif site_group and normalize_group(doc_group)[:2] == normalize_group(site_group)[:2]:
+                                is_match = True
+
+                            if is_match and site_group:
+                                student_found = True
+                                for label in doc_columns.keys():
+                                    val = s_data.get(label)
+                                    if val and val not in aggregated_site_data[label]:
+                                        aggregated_site_data[label].append(val)
                             else:
-                                row_data[label] = ""
+                                disp_group = site_group if site_group else "Отсутствует"
+                                log_both(f"  [!] Пропуск: {current_site_fio}. Группа [{disp_group}] не подошла.",
+                                         "muted")
 
-                        fio = row_data.get('ФИО', "")
-                        doc_group = row_data.get('Группа', "")
+                    if student_found:
+                        self.stats["found"] += 1
 
-                        if not fio or fio == doc_group:
+                except Exception as e:
+                    self.stats["errors"] += 1
+                    log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
+
+                if not student_found:
+                    self.stats["not_found"] += 1
+                    log_both(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.", "error")
+                    fio_cell = row.cells[doc_columns['ФИО']]
+                    for paragraph in fio_cell.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.color.rgb = RGBColor(255, 0, 0)
+                    self.update_stats()
+                    continue
+
+                try:
+                    row_updated = False
+                    for label, col_idx in doc_columns.items():
+                        if not aggregated_site_data[label]:
                             continue
 
-                        self.stats["processed"] += 1
-                        percent = int(((idx + 1) / total_rows) * 100)
-                        self.update_status(f"Обработка: {idx + 1} из {total_rows} ({fio})", percent)
-                        log_both("-" * 40)
-                        log_both(f"[{idx + 1}/{total_rows}] Обработка: {fio}")
+                        if label == 'ФИО':
+                            final_val = aggregated_site_data['ФИО'][0]
+                        else:
+                            final_val = ", ".join(aggregated_site_data[label])
 
-                        variations = get_name_variations(fio)
-                        student_found = False
-                        aggregated_site_data = {label: [] for label in doc_columns.keys()}
+                        doc_val = row_data.get(label, "")
 
-                        try:
-                            for current_fio in variations:
-                                if student_found or self.cancel_event.is_set():
-                                    break
+                        if doc_val != final_val and final_val:
+                            display_doc_val = doc_val if doc_val else "пусто"
+                            log_both(f"🔄 Обновляем [{label}]: {display_doc_val} -> {final_val}", "success")
+                            changes_summary.append(
+                                f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
+                                f"[{display_doc_val}] ➔ [{final_val}]")
+                            row.cells[col_idx].text = final_val
+                            row_updated = True
 
-                                try:
-                                    search_input = goto_search()
-                                except Exception as e:
-                                    log_both(f"  [!] Не удалось открыть страницу поиска: {e}", "error")
-                                    continue
-
-                                search_input.click()
-                                search_input.fill(current_fio)
-
-                                listbox_options = page.locator("div[role='listbox'] div[role='option']")
-
-                                try:
-                                    listbox_options.first.wait_for(state="visible", timeout=6000)
-                                    options_count = listbox_options.count()
-                                except Exception:
-                                    options_count = 0
-
-                                if options_count == 0:
-                                    continue
-
-                                for opt_idx in range(options_count - 1, -1, -1):
-                                    if self.cancel_event.is_set():
-                                        break
-
-                                    if opt_idx < options_count - 1:
-                                        try:
-                                            search_input = goto_search()
-                                        except Exception as e:
-                                            log_both(f"  [!] Не удалось перезагрузить поиск: {e}", "error")
-                                            break
-                                        search_input.click()
-                                        search_input.fill(current_fio)
-                                        listbox_options = page.locator("div[role='listbox'] div[role='option']")
-                                        try:
-                                            listbox_options.first.wait_for(state="visible", timeout=6000)
-                                        except Exception:
-                                            break
-
-                                    if opt_idx >= listbox_options.count():
-                                        continue
-
-                                    target_option = listbox_options.nth(opt_idx)
-                                    raw_text = target_option.inner_text().strip().split('\n')[0]
-                                    current_site_fio = raw_text.split('(')[0].strip()
-
-                                    # Защита от ложного совпадения похожих ФИО в выдаче поиска
-                                    sim = fio_similarity(fio, current_site_fio)
-                                    if sim < similarity_threshold:
-                                        log_both(
-                                            f"  [!] Пропуск профиля: {current_site_fio}. "
-                                            f"Схожесть ФИО слишком низкая ({sim:.2f}).", "warn")
-                                        continue
-
-                                    target_option.click()
-
-                                    try:
-                                        page.locator(
-                                            "xpath=//label[contains(text(), 'ФИО')]/following-sibling::input"
-                                        ).wait_for(state="attached", timeout=6000)
-                                        # ждём, пока значение реально подтянется, а не просто появится поле
-                                        fio_input = page.locator(
-                                            "xpath=//label[contains(text(), 'ФИО')]/following-sibling::input").first
-                                        for _ in range(20):
-                                            if fio_input.input_value().strip():
-                                                break
-                                            page.wait_for_timeout(100)
-                                    except Exception:
-                                        pass
-
-                                    site_data_current = {}
-                                    for label in doc_columns.keys():
-                                        xpath = f"xpath=//label[contains(text(), '{label}')]/following-sibling::input"
-                                        loc = page.locator(xpath)
-                                        if loc.count() > 0:
-                                            site_data_current[label] = loc.first.input_value().strip()
-                                        else:
-                                            site_data_current[label] = ""
-
-                                    if not site_data_current.get('ФИО') and current_site_fio:
-                                        site_data_current['ФИО'] = current_site_fio
-
-                                    site_group = site_data_current.get('Группа', "")
-
-                                    is_match = False
-                                    if not doc_group:
-                                        is_match = True
-                                    elif not use_smart_group:
-                                        if site_group:
-                                            is_match = True
-                                    elif site_group and normalize_group(doc_group)[:1] == normalize_group(site_group)[:1]:
-                                        is_match = True
-
-                                    if is_match and site_group:
-                                        student_found = True
-                                        self.stats["found"] += 1
-                                        for label in doc_columns.keys():
-                                            val = site_data_current.get(label)
-                                            if val and val not in aggregated_site_data[label]:
-                                                aggregated_site_data[label].append(val)
-                                    else:
-                                        disp_group = site_group if site_group else "Отсутствует (Сотрудник)"
-                                        log_both(
-                                            f"  [!] Пропуск профиля: {current_site_fio}. "
-                                            f"Группа [{disp_group}] не подошла.", "muted")
-                        except Exception as e:
-                            self.stats["errors"] += 1
-                            log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
-
-                        if not student_found:
-                            self.stats["not_found"] += 1
-                            log_both(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.", "error")
-                            fio_cell = row.cells[doc_columns['ФИО']]
-                            for paragraph in fio_cell.paragraphs:
+                            for paragraph in row.cells[col_idx].paragraphs:
                                 for run in paragraph.runs:
-                                    run.font.color.rgb = RGBColor(255, 0, 0)
-                            self.update_stats()
-                            continue
+                                    run.font.color.rgb = RGBColor(0, 140, 40)
 
-                        try:
-                            row_updated = False
-                            for label, col_idx in doc_columns.items():
-                                if not aggregated_site_data[label]:
-                                    continue
+                    if row_updated:
+                        self.stats["updated"] += 1
 
-                                if label == 'ФИО':
-                                    final_val = aggregated_site_data['ФИО'][0]
-                                else:
-                                    final_val = ", ".join(aggregated_site_data[label])
+                except Exception as e:
+                    self.stats["errors"] += 1
+                    log_both(f"⚠️ Ошибка при записи данных {fio}: {e}", "error")
 
-                                doc_val = row_data.get(label, "")
-
-                                if doc_val != final_val and final_val:
-                                    display_doc_val = doc_val if doc_val else "пусто"
-                                    log_both(f"🔄 Обновляем [{label}]: {display_doc_val} -> {final_val}", "success")
-                                    changes_summary.append(
-                                        f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
-                                        f"[{display_doc_val}] ➔ [{final_val}]")
-                                    row.cells[col_idx].text = final_val
-                                    row_updated = True
-                                    # подсветка обновлённой ячейки зелёным
-                                    for paragraph in row.cells[col_idx].paragraphs:
-                                        for run in paragraph.runs:
-                                            run.font.color.rgb = RGBColor(0, 140, 40)
-
-                            if row_updated:
-                                self.stats["updated"] += 1
-
-                        except Exception as e:
-                            self.stats["errors"] += 1
-                            log_both(f"⚠️ Ошибка при записи данных {fio}: {e}", "error")
-
-                        self.update_stats()
-
-                finally:
-                    browser.close()
+                self.update_stats()
 
             name, ext = os.path.splitext(file_path)
             updated_file_path = f"{name}_ОБНОВЛЕННЫЙ{ext}"
@@ -858,7 +893,7 @@ class DocCheckerApp:
                 log_both("✅ Проверка завершена! Файл сохранен.", "success")
 
             self.msg_queue.put({"type": "done", "path": updated_file_path, "changes": changes_summary,
-                                 "cancelled": cancelled})
+                                "cancelled": cancelled})
 
         except Exception as e:
             self.msg_queue.put({"type": "error", "text": str(e)})
