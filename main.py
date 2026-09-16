@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import copy
 import difflib
 import threading
 import queue
@@ -12,7 +13,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from docx import Document
-from docx.shared import RGBColor
+from docx.shared import RGBColor, Pt
+from docx.oxml.ns import qn
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 
@@ -31,13 +33,13 @@ CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 LOG_DIR = os.path.join(_app_dir(), "logs")
 
 DEFAULT_CONFIG = {
-    "login": "",
-    "password": "",
+    "login": "eselezneva",
+    "password": "RZiPbrQA",
     "base_url": "https://edu.donstu.ru/WebApp/#",
     "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
     "auto_open_result": True,
-    "fio_similarity_threshold": 0.55,  # защита от ложных совпадений похожих ФИО
+    "fio_similarity_threshold": 0,  # защита от ложных совпадений похожих ФИО
     "jwt_token": "",
     "user_id": ""
 }
@@ -87,7 +89,6 @@ SITE_LABELS_MAPPING = {
     'групп': 'Группа',
     'курс': 'Курс',
     'зачетн': 'Номер зачетной книжки',
-    'зачетка': 'Номер зачетной книжки',
     'зачётн': 'Номер зачетной книжки',
     'факультет': 'Факультет',
     'кафедр': 'Кафедра',
@@ -129,8 +130,8 @@ class DocCheckerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Автоматизация проверки студентов ДГТУ")
-        self.root.geometry("700x760")
-        self.root.minsize(620, 620)
+        self.root.geometry("700x790")
+        self.root.minsize(620, 650)
         self.root.configure(padx=25, pady=20, bg="#FFFFFF")
 
         self.config_data = load_config()
@@ -205,6 +206,14 @@ class DocCheckerApp:
             activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
         )
         self.chk_smart_group.pack(anchor=tk.W)
+
+        self.sort_college_var = tk.BooleanVar(value=False)
+        self.chk_sort_college = tk.Checkbutton(
+            self.frame_options, text="Сортировать магистратура и колледж (разбить итог на 5 таблиц)",
+            variable=self.sort_college_var, font=("Segoe UI", 10), bg="#FFFFFF", fg="#333333",
+            activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
+        )
+        self.chk_sort_college.pack(anchor=tk.W)
 
         self.headless_var = tk.BooleanVar(value=self.config_data.get("headless", False))
         self.chk_headless = tk.Checkbutton(
@@ -357,7 +366,17 @@ class DocCheckerApp:
             "Из карточки студента извлекаются: ФИО, номер зачетки, группа, "
             "кафедра, факультет, курс, год поступления, дата рождения и гражданство (национальность). "
             "Если данные (например, дата рождения) скрыты настройками приватности профиля, "
-            "скрипт корректно их пропустит и оставит ячейку пустой."
+            "скрипт корректно их пропустит и оставит ячейку пустой.\n\n"
+            "СОРТИРОВКА МАГИСТРАТУРА/КОЛЛЕДЖ:\n"
+            "Если включена галочка «Сортировать магистратура и колледж», по завершении проверки "
+            "итоговая таблица будет разбита на 5 отдельных таблиц (по данным факультета/кафедры, "
+            "полученным с сайта):\n"
+            "1. Магистратура — факультет содержит «магистратура»\n"
+            "2. Авиационно-технологический колледж — факультет содержит «колледж», "
+            "кафедра — «Авиационно-технологический колледж»\n"
+            "3. ИТХАБ — факультет содержит «колледж», кафедра — «ИТХАБ»\n"
+            "4. КЭУП — остальные студенты с факультетом «колледж»\n"
+            "5. Остальные студенты — все прочие (включая ненайденных)"
         )
         messagebox.showinfo("О программе и форматах колонок", about_text)
 
@@ -525,6 +544,7 @@ class DocCheckerApp:
         self.btn_stop.config(state=tk.NORMAL)
 
         use_smart_group = self.smart_group_var.get()
+        use_sort_college = self.sort_college_var.get()
         headless = self.headless_var.get()
         self.config_data["headless"] = headless
         self.config_data["auto_open_result"] = self.auto_open_var.get()
@@ -545,7 +565,7 @@ class DocCheckerApp:
         self.update_status("Инициализация...", 0)
 
         threading.Thread(target=self.process_file_worker,
-                         args=(self.file_path, use_smart_group, headless), daemon=True).start()
+                         args=(self.file_path, use_smart_group, headless, use_sort_college), daemon=True).start()
 
     def stop_processing(self):
         if self.is_running:
@@ -672,9 +692,53 @@ class DocCheckerApp:
 
         return extracted_token, extracted_user_id
 
+    # -------------------------------------------------------- Разбивка на таблицы --
+
+    @staticmethod
+    def _clone_table_with_rows(original_table, row_elements):
+        """Клонирует таблицу (стиль, шапка), заменяя тело новым набором строк (tr)."""
+        new_tbl = copy.deepcopy(original_table._tbl)
+        trs = new_tbl.findall(qn('w:tr'))
+        if trs:
+            # оставляем первую строку (шапку), удаляем остальные исходные строки
+            for tr in trs[1:]:
+                new_tbl.remove(tr)
+        for tr in row_elements:
+            new_tbl.append(copy.deepcopy(tr))
+        return new_tbl
+
+    def split_table_by_category(self, doc, target_table, category_rows, log_both):
+        """Заменяет target_table на 5 таблиц: Магистратура / Авиа-колледж / ИТХАБ / КЭУП / Остальные."""
+        categories = [
+            ("Магистратуры", category_rows['magistracy']),
+            ("Авиационно-технологический колледж", category_rows['avia']),
+            ("ИТХАБ", category_rows['itkhab']),
+            ("КЭУП", category_rows['keup']),
+            ("Остальные студенты", category_rows['other']),
+        ]
+
+        anchor = target_table._tbl
+
+        for title, rows in categories:
+            heading_para = doc.add_paragraph()
+            run = heading_para.add_run(f"{title} ({len(rows)})")
+            run.bold = True
+            run.font.size = Pt(14)
+            anchor.addprevious(heading_para._p)
+
+            new_tbl_element = self._clone_table_with_rows(target_table, rows)
+            anchor.addprevious(new_tbl_element)
+
+            spacer = doc.add_paragraph()
+            anchor.addprevious(spacer._p)
+
+            log_both(f"  • {title}: {len(rows)} студент(ов)")
+
+        anchor.getparent().remove(anchor)
+
     # -------------------------------------------------------- Обработка --
 
-    def process_file_worker(self, file_path, use_smart_group, headless):
+    def process_file_worker(self, file_path, use_smart_group, headless, use_sort_college=False):
         os.makedirs(LOG_DIR, exist_ok=True)
         log_file_path = os.path.join(LOG_DIR, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         log_lines = []
@@ -722,6 +786,9 @@ class DocCheckerApp:
             log_both(f"Найдены колонки: {', '.join(doc_columns.keys())}")
             total_rows = len(target_table.rows) - 1
             changes_summary = []
+
+            # Категории для сортировки магистратура/колледж (заполняются в основном цикле)
+            category_rows = {'magistracy': [], 'avia': [], 'itkhab': [], 'keup': [], 'other': []}
 
             # ---- ПРОВЕРКА / ПОЛУЧЕНИЕ JWT ----
             jwt_token = self.config_data.get("jwt_token")
@@ -792,6 +859,10 @@ class DocCheckerApp:
                 student_found = False
                 aggregated_site_data = {label: [] for label in doc_columns.keys()}
 
+                # Данные для классификации по магистратуре/колледжу (не зависят от колонок в документе)
+                classify_faculty = ""
+                classify_department = ""
+
                 try:
                     for current_fio in variations:
                         if student_found or self.cancel_event.is_set():
@@ -822,6 +893,8 @@ class DocCheckerApp:
 
                             if is_match and site_group:
                                 student_found = True
+                                classify_faculty = s_data.get('Факультет') or classify_faculty
+                                classify_department = s_data.get('Кафедра') or classify_department
                                 for label in doc_columns.keys():
                                     val = s_data.get(label)
                                     if val and val not in aggregated_site_data[label]:
@@ -837,6 +910,23 @@ class DocCheckerApp:
                 except Exception as e:
                     self.stats["errors"] += 1
                     log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
+
+                # ---- Классификация студента (магистратура / колледж / прочие) ----
+                if use_sort_college:
+                    faculty_val = (classify_faculty or "").strip().lower()
+                    department_val = (classify_department or "").strip().lower()
+
+                    if 'магистратуры' in faculty_val:
+                        category_rows['magistracy'].append(row._tr)
+                    elif 'колледж' in faculty_val:
+                        if 'авиационно-технологический' in department_val:
+                            category_rows['avia'].append(row._tr)
+                        elif 'итхаб' in department_val:
+                            category_rows['itkhab'].append(row._tr)
+                        else:
+                            category_rows['keup'].append(row._tr)
+                    else:
+                        category_rows['other'].append(row._tr)
 
                 if not student_found:
                     self.stats["not_found"] += 1
@@ -882,6 +972,15 @@ class DocCheckerApp:
                     log_both(f"⚠️ Ошибка при записи данных {fio}: {e}", "error")
 
                 self.update_stats()
+
+            # ---- РАЗБИВКА НА 5 ТАБЛИЦ (если включена галочка) ----
+            if use_sort_college:
+                log_both("-" * 40)
+                log_both("Сортировка студентов по таблицам (магистратура/колледж)...")
+                try:
+                    self.split_table_by_category(doc, target_table, category_rows, log_both)
+                except Exception as e:
+                    log_both(f"⚠️ Не удалось разбить таблицу на категории: {e}", "error")
 
             name, ext = os.path.splitext(file_path)
             updated_file_path = f"{name}_ОБНОВЛЕННЫЙ{ext}"
