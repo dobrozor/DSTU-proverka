@@ -33,8 +33,8 @@ CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 LOG_DIR = os.path.join(_app_dir(), "logs")
 
 DEFAULT_CONFIG = {
-    "login": "",
-    "password": "",
+    "login": "eselezneva",
+    "password": "RZiPbrQA",
     "base_url": "https://edu.donstu.ru/WebApp/#",
     "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
@@ -209,7 +209,7 @@ class DocCheckerApp:
 
         self.sort_college_var = tk.BooleanVar(value=False)
         self.chk_sort_college = tk.Checkbutton(
-            self.frame_options, text="Сортировать магистратура и колледж (разбить итог на 5 таблиц)",
+            self.frame_options, text="Сортировать магистратура и колледж (разбить итог на 3 таблицы)",
             variable=self.sort_college_var, font=("Segoe UI", 10), bg="#FFFFFF", fg="#333333",
             activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
         )
@@ -369,14 +369,11 @@ class DocCheckerApp:
             "скрипт корректно их пропустит и оставит ячейку пустой.\n\n"
             "СОРТИРОВКА МАГИСТРАТУРА/КОЛЛЕДЖ:\n"
             "Если включена галочка «Сортировать магистратура и колледж», по завершении проверки "
-            "итоговая таблица будет разбита на 5 отдельных таблиц (по данным факультета/кафедры, "
+            "итоговая таблица будет разбита на 3 отдельные таблицы (по данным факультета, "
             "полученным с сайта):\n"
             "1. Магистратура — факультет содержит «магистратура»\n"
-            "2. Авиационно-технологический колледж — факультет содержит «колледж», "
-            "кафедра — «Авиационно-технологический колледж»\n"
-            "3. ИТХАБ — факультет содержит «колледж», кафедра — «ИТХАБ»\n"
-            "4. КЭУП — остальные студенты с факультетом «колледж»\n"
-            "5. Остальные студенты — все прочие (включая ненайденных)"
+            "2. Колледжи — факультет содержит «колледж»\n"
+            "3. Остальные студенты — все прочие (включая ненайденных)"
         )
         messagebox.showinfo("О программе и форматах колонок", about_text)
 
@@ -692,52 +689,6 @@ class DocCheckerApp:
 
         return extracted_token, extracted_user_id
 
-    # -------------------------------------------------------- Разбивка на таблицы --
-
-    @staticmethod
-    def _clone_table_with_rows(original_table, row_elements):
-        """Клонирует таблицу (стиль, шапка), заменяя тело новым набором строк (tr)."""
-        new_tbl = copy.deepcopy(original_table._tbl)
-        trs = new_tbl.findall(qn('w:tr'))
-        if trs:
-            # оставляем первую строку (шапку), удаляем остальные исходные строки
-            for tr in trs[1:]:
-                new_tbl.remove(tr)
-        for tr in row_elements:
-            new_tbl.append(copy.deepcopy(tr))
-        return new_tbl
-
-    def split_table_by_category(self, doc, target_table, category_rows, log_both):
-        """Заменяет target_table на 5 таблиц: Магистратура / Авиа-колледж / ИТХАБ / КЭУП / Остальные."""
-        categories = [
-            ("Магистратуры", category_rows['magistracy']),
-            ("Авиационно-технологический колледж", category_rows['avia']),
-            ("ИТХАБ", category_rows['itkhab']),
-            ("КЭУП", category_rows['keup']),
-            ("Остальные студенты", category_rows['other']),
-        ]
-
-        anchor = target_table._tbl
-
-        for title, rows in categories:
-            heading_para = doc.add_paragraph()
-            run = heading_para.add_run(f"{title} ({len(rows)})")
-            run.bold = True
-            run.font.size = Pt(14)
-            anchor.addprevious(heading_para._p)
-
-            new_tbl_element = self._clone_table_with_rows(target_table, rows)
-            anchor.addprevious(new_tbl_element)
-
-            spacer = doc.add_paragraph()
-            anchor.addprevious(spacer._p)
-
-            log_both(f"  • {title}: {len(rows)} студент(ов)")
-
-        anchor.getparent().remove(anchor)
-
-    # -------------------------------------------------------- Обработка --
-
     def process_file_worker(self, file_path, use_smart_group, headless, use_sort_college=False):
         os.makedirs(LOG_DIR, exist_ok=True)
         log_file_path = os.path.join(LOG_DIR, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
@@ -755,40 +706,35 @@ class DocCheckerApp:
                 self.msg_queue.put({"type": "error", "text": "В документе не найдены таблицы."})
                 return
 
-            target_table = None
-            headers = []
-            for tbl in doc.tables:
+            # СБОР ВСЕХ ТАБЛИЦ С ФИО
+            target_tables_info = []
+            for tbl_idx, tbl in enumerate(doc.tables):
                 if len(tbl.rows) == 0:
                     continue
                 current_headers = [cell.text.strip().lower() for cell in tbl.rows[0].cells]
-                if any('фио' in h.replace(" ", "") or 'ф.и.о' in h.replace(" ", "") for h in current_headers):
-                    target_table = tbl
-                    headers = current_headers
-                    break
 
-            if not target_table:
+                if any('фио' in h.replace(" ", "") or 'ф.и.о' in h.replace(" ", "") for h in current_headers):
+                    doc_columns = {}
+                    for i, h in enumerate(current_headers):
+                        h_clean = h.replace(" ", "").replace(".", "")
+                        for key, label in SITE_LABELS_MAPPING.items():
+                            if key in h_clean:
+                                doc_columns[label] = i
+                                break
+                    if 'ФИО' in doc_columns:
+                        target_tables_info.append((tbl_idx, tbl, doc_columns))
+
+            if not target_tables_info:
                 self.msg_queue.put(
                     {"type": "error", "text": "В документе не найдена таблица со списком студентов (нет колонки ФИО)."})
                 return
 
-            doc_columns = {}
-            for i, h in enumerate(headers):
-                h_clean = h.replace(" ", "").replace(".", "")
-                for key, label in SITE_LABELS_MAPPING.items():
-                    if key in h_clean:
-                        doc_columns[label] = i
-                        break
+            total_rows = sum(len(tbl.rows) - 1 for _, tbl, _ in target_tables_info)
+            log_both(f"Найдено таблиц для обработки: {len(target_tables_info)}. Всего студентов: {total_rows}")
 
-            if 'ФИО' not in doc_columns:
-                self.msg_queue.put({"type": "error", "text": "Колонка ФИО не распознана."})
-                return
-
-            log_both(f"Найдены колонки: {', '.join(doc_columns.keys())}")
-            total_rows = len(target_table.rows) - 1
             changes_summary = []
-
-            # Категории для сортировки магистратура/колледж (заполняются в основном цикле)
-            category_rows = {'magistracy': [], 'avia': [], 'itkhab': [], 'keup': [], 'other': []}
+            row_categories = {}  # Ключ: (tbl_idx, local_row_idx)
+            global_row_idx = 0
 
             # ---- ПРОВЕРКА / ПОЛУЧЕНИЕ JWT ----
             jwt_token = self.config_data.get("jwt_token")
@@ -829,170 +775,207 @@ class DocCheckerApp:
                     self.msg_queue.put({"type": "error", "text": f"Ошибка авторизации: {e}"})
                     return
 
-            # ---- ОСНОВНОЙ ЦИКЛ ПО ТАБЛИЦЕ ----
-            for idx, row in enumerate(target_table.rows[1:]):
-                if self.cancel_event.is_set():
-                    cancelled = True
-                    log_both("⏹ Остановлено пользователем перед следующим студентом.", "warn")
+            # ---- ОСНОВНОЙ ЦИКЛ ПО ТАБЛИЦАМ ----
+            for tbl_idx, tbl, doc_columns in target_tables_info:
+                if cancelled:
                     break
 
-                row_data = {}
-                for label, col_idx in doc_columns.items():
-                    if col_idx < len(row.cells):
-                        row_data[label] = row.cells[col_idx].text.strip()
-                    else:
-                        row_data[label] = ""
+                for local_row_idx, row in enumerate(tbl.rows[1:]):
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                        log_both("⏹ Остановлено пользователем перед следующим студентом.", "warn")
+                        break
 
-                fio = row_data.get('ФИО', "")
-                doc_group = row_data.get('Группа', "")
-
-                if not fio or fio == doc_group:
-                    continue
-
-                self.stats["processed"] += 1
-                percent = int(((idx + 1) / total_rows) * 100)
-                self.update_status(f"Обработка: {idx + 1} из {total_rows} ({fio})", percent)
-                log_both("-" * 40)
-                log_both(f"[{idx + 1}/{total_rows}] Обработка: {fio}")
-
-                variations = get_name_variations(fio)
-                student_found = False
-                aggregated_site_data = {label: [] for label in doc_columns.keys()}
-
-                # Данные для классификации по магистратуре/колледжу (не зависят от колонок в документе)
-                classify_faculty = ""
-                classify_department = ""
-
-                try:
-                    for current_fio in variations:
-                        if student_found or self.cancel_event.is_set():
-                            break
-
-                        api_students = self.fetch_student_api(current_fio, jwt_token, user_id)
-
-                        for s_data in api_students:
-                            current_site_fio = s_data.get('ФИО', "")
-                            if not current_site_fio:
-                                continue
-
-                            sim = fio_similarity(fio, current_site_fio)
-                            if sim < self.config_data.get("fio_similarity_threshold", 0.55):
-                                log_both(f"  [!] Пропуск: {current_site_fio}. Схожесть ({sim:.2f}).", "warn")
-                                continue
-
-                            site_group = s_data.get('Группа', "")
-                            is_match = False
-
-                            if not doc_group:
-                                is_match = True
-                            elif not use_smart_group:
-                                if site_group:
-                                    is_match = True
-                            elif site_group and normalize_group(doc_group)[:2] == normalize_group(site_group)[:2]:
-                                is_match = True
-
-                            if is_match and site_group:
-                                student_found = True
-                                classify_faculty = s_data.get('Факультет') or classify_faculty
-                                classify_department = s_data.get('Кафедра') or classify_department
-                                for label in doc_columns.keys():
-                                    val = s_data.get(label)
-                                    if val and val not in aggregated_site_data[label]:
-                                        aggregated_site_data[label].append(val)
-                            else:
-                                disp_group = site_group if site_group else "Отсутствует"
-                                log_both(f"  [!] Пропуск: {current_site_fio}. Группа [{disp_group}] не подошла.",
-                                         "muted")
-
-                    if student_found:
-                        self.stats["found"] += 1
-
-                except Exception as e:
-                    self.stats["errors"] += 1
-                    log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
-
-                # ---- Классификация студента (магистратура / колледж / прочие) ----
-                if use_sort_college:
-                    faculty_val = (classify_faculty or "").strip().lower()
-                    department_val = (classify_department or "").strip().lower()
-
-                    if 'магистратуры' in faculty_val:
-                        category_rows['magistracy'].append(row._tr)
-                    elif 'колледж' in faculty_val:
-                        if 'авиационно-технологический' in department_val:
-                            category_rows['avia'].append(row._tr)
-                        elif 'итхаб' in department_val:
-                            category_rows['itkhab'].append(row._tr)
-                        else:
-                            category_rows['keup'].append(row._tr)
-                    else:
-                        category_rows['other'].append(row._tr)
-
-                if not student_found:
-                    self.stats["not_found"] += 1
-                    log_both(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.", "error")
-                    fio_cell = row.cells[doc_columns['ФИО']]
-                    for paragraph in fio_cell.paragraphs:
-                        for run in paragraph.runs:
-                            run.font.color.rgb = RGBColor(255, 0, 0)
-                    self.update_stats()
-                    continue
-
-                try:
-                    row_updated = False
+                    global_row_idx += 1
+                    row_data = {}
                     for label, col_idx in doc_columns.items():
-                        if not aggregated_site_data[label]:
-                            continue
-
-                        if label == 'ФИО':
-                            final_val = aggregated_site_data['ФИО'][0]
+                        if col_idx < len(row.cells):
+                            row_data[label] = row.cells[col_idx].text.strip()
                         else:
-                            final_val = ", ".join(aggregated_site_data[label])
+                            row_data[label] = ""
 
-                        doc_val = row_data.get(label, "")
+                    fio = row_data.get('ФИО', "")
+                    doc_group = row_data.get('Группа', "")
 
-                        if doc_val != final_val and final_val:
-                            display_doc_val = doc_val if doc_val else "пусто"
-                            log_both(f"🔄 Обновляем [{label}]: {display_doc_val} -> {final_val}", "success")
-                            changes_summary.append(
-                                f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
-                                f"[{display_doc_val}] ➔ [{final_val}]")
-                            row.cells[col_idx].text = final_val
-                            row_updated = True
+                    # Если ФИО пустое или совпадает с группой (возможно, это заголовок мероприятия)
+                    if not fio or fio == doc_group:
+                        continue
 
-                            for paragraph in row.cells[col_idx].paragraphs:
-                                for run in paragraph.runs:
-                                    run.font.color.rgb = RGBColor(0, 140, 40)
+                    self.stats["processed"] += 1
+                    percent = int((global_row_idx / total_rows) * 100)
+                    self.update_status(f"Обработка: {global_row_idx} из {total_rows} ({fio})", percent)
+                    log_both(f"[{global_row_idx}/{total_rows}] Обработка: {fio}")
 
-                    if row_updated:
-                        self.stats["updated"] += 1
+                    variations = get_name_variations(fio)
+                    student_found = False
+                    aggregated_site_data = {label: [] for label in doc_columns.keys()}
 
-                except Exception as e:
-                    self.stats["errors"] += 1
-                    log_both(f"⚠️ Ошибка при записи данных {fio}: {e}", "error")
+                    classify_faculty = ""
 
-                self.update_stats()
+                    try:
+                        for current_fio in variations:
+                            if student_found or self.cancel_event.is_set():
+                                break
 
-            # ---- РАЗБИВКА НА 5 ТАБЛИЦ (если включена галочка) ----
-            if use_sort_college:
-                log_both("-" * 40)
-                log_both("Сортировка студентов по таблицам (магистратура/колледж)...")
-                try:
-                    self.split_table_by_category(doc, target_table, category_rows, log_both)
-                except Exception as e:
-                    log_both(f"⚠️ Не удалось разбить таблицу на категории: {e}", "error")
+                            api_students = self.fetch_student_api(current_fio, jwt_token, user_id)
 
+                            for s_data in api_students:
+                                current_site_fio = s_data.get('ФИО', "")
+                                if not current_site_fio:
+                                    continue
+
+                                sim = fio_similarity(fio, current_site_fio)
+                                if sim < self.config_data.get("fio_similarity_threshold", 0.55):
+                                    log_both(f"  [!] Пропуск: {current_site_fio}. Схожесть ({sim:.2f}).", "warn")
+                                    continue
+
+                                site_group = s_data.get('Группа', "")
+                                is_match = False
+
+                                if not doc_group:
+                                    is_match = True
+                                elif not use_smart_group:
+                                    if site_group:
+                                        is_match = True
+                                elif site_group and normalize_group(doc_group)[:2] == normalize_group(site_group)[:2]:
+                                    is_match = True
+
+                                if is_match and site_group:
+                                    student_found = True
+                                    classify_faculty = s_data.get('Факультет') or classify_faculty
+                                    for label in doc_columns.keys():
+                                        val = s_data.get(label)
+                                        if val and val not in aggregated_site_data[label]:
+                                            aggregated_site_data[label].append(val)
+                                else:
+                                    disp_group = site_group if site_group else "Отсутствует"
+                                    log_both(f"  [!] Пропуск: {current_site_fio}. Группа [{disp_group}] не подошла.",
+                                             "muted")
+
+                        if student_found:
+                            self.stats["found"] += 1
+
+                    except Exception as e:
+                        self.stats["errors"] += 1
+                        log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
+
+                    # ---- Классификация студента для разделения на файлы ----
+                    if use_sort_college:
+                        faculty_val = (classify_faculty or "").strip().lower()
+                        if 'магистратуры' in faculty_val:
+                            row_categories[(tbl_idx, local_row_idx)] = 'magistracy'
+                        elif 'колледж' in faculty_val:
+                            row_categories[(tbl_idx, local_row_idx)] = 'college'
+                        else:
+                            row_categories[(tbl_idx, local_row_idx)] = 'other'
+
+                    if not student_found:
+                        self.stats["not_found"] += 1
+                        log_both(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.", "error")
+                        fio_cell = row.cells[doc_columns['ФИО']]
+                        for paragraph in fio_cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.color.rgb = RGBColor(255, 0, 0)
+                        self.update_stats()
+                        continue
+
+                    try:
+                        row_updated = False
+                        for label, col_idx in doc_columns.items():
+                            if not aggregated_site_data[label]:
+                                continue
+
+                            if label == 'ФИО':
+                                final_val = aggregated_site_data['ФИО'][0]
+                            else:
+                                final_val = ", ".join(aggregated_site_data[label])
+
+                            doc_val = row_data.get(label, "")
+
+                            if doc_val != final_val and final_val:
+                                display_doc_val = doc_val if doc_val else "пусто"
+                                log_both(f"🔄 Обновляем [{label}]: {display_doc_val} -> {final_val}", "success")
+                                changes_summary.append(
+                                    f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
+                                    f"[{display_doc_val}] ➔ [{final_val}]")
+                                row.cells[col_idx].text = final_val
+                                row_updated = True
+
+                                for paragraph in row.cells[col_idx].paragraphs:
+                                    for run in paragraph.runs:
+                                        run.font.color.rgb = RGBColor(0, 140, 40)
+
+                        if row_updated:
+                            self.stats["updated"] += 1
+
+                    except Exception as e:
+                        self.stats["errors"] += 1
+                        log_both(f"⚠️ Ошибка при записи данных {fio}: {e}", "error")
+
+                    self.update_stats()
+
+            # ---- ФИНАЛЬНОЕ СОХРАНЕНИЕ / РАЗБИВКА НА 3 ФАЙЛА ----
             name, ext = os.path.splitext(file_path)
-            updated_file_path = f"{name}_ОБНОВЛЕННЫЙ{ext}"
-            doc.save(updated_file_path)
 
-            if cancelled:
-                log_both("⏹ Проверка остановлена. Файл сохранён с уже внесёнными изменениями.", "warn")
-            else:
+            if not use_sort_college:
+                updated_file_path = f"{name}_ОБНОВЛЕННЫЙ{ext}"
+                doc.save(updated_file_path)
                 log_both("✅ Проверка завершена! Файл сохранен.", "success")
+                self.msg_queue.put(
+                    {"type": "done", "path": updated_file_path, "changes": changes_summary, "cancelled": cancelled})
+            else:
+                log_both("Создание трех отдельных файлов (Магистратура, Колледжи, Остальные)...")
 
-            self.msg_queue.put({"type": "done", "path": updated_file_path, "changes": changes_summary,
-                                "cancelled": cancelled})
+                base_temp_path = f"{name}_temp_base{ext}"
+                doc.save(base_temp_path)
+
+                categories_files = [
+                    ('magistracy', "Магистратура"),
+                    ('college', "Колледжи"),
+                    ('other', "Остальные")
+                ]
+
+                first_saved_path = None
+
+                for cat_key, cat_name in categories_files:
+                    try:
+                        cat_doc = Document(base_temp_path)
+
+                        # Проходимся по всем собранным таблицам и чистим лишние строки
+                        for tbl_idx, _, _ in target_tables_info:
+                            cat_table = cat_doc.tables[tbl_idx]
+                            rows_to_remove = []
+
+                            for local_row_idx, r in enumerate(cat_table.rows[1:]):
+                                r_cat = row_categories.get((tbl_idx, local_row_idx))
+                                if r_cat and r_cat != cat_key:
+                                    rows_to_remove.append(r)
+
+                            for r in rows_to_remove:
+                                r._tr.getparent().remove(r._tr)
+
+                        out_path = f"{name}_{cat_name}{ext}"
+                        cat_doc.save(out_path)
+
+                        if not first_saved_path:
+                            first_saved_path = out_path
+
+                        log_both(f"  • Сохранен файл: {os.path.basename(out_path)}")
+                    except Exception as e:
+                        log_both(f"⚠️ Ошибка при создании файла {cat_name}: {e}", "error")
+
+                try:
+                    os.remove(base_temp_path)
+                except Exception:
+                    pass
+
+                if cancelled:
+                    log_both("⏹ Проверка остановлена. Файлы сохранены с уже внесёнными изменениями.", "warn")
+                else:
+                    log_both("✅ Проверка завершена! Файлы успешно разбиты.", "success")
+
+                self.msg_queue.put(
+                    {"type": "done", "path": first_saved_path, "changes": changes_summary, "cancelled": cancelled})
 
         except Exception as e:
             self.msg_queue.put({"type": "error", "text": str(e)})
@@ -1002,7 +985,6 @@ class DocCheckerApp:
                     f.write("\n".join(log_lines))
             except Exception:
                 pass
-
 
 if __name__ == '__main__':
     root = tk.Tk()
