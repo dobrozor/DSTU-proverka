@@ -33,8 +33,8 @@ CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 LOG_DIR = os.path.join(_app_dir(), "logs")
 
 DEFAULT_CONFIG = {
-    "login": "eselezneva",
-    "password": "RZiPbrQA",
+    "login": "",
+    "password": "",
     "base_url": "https://edu.donstu.ru/WebApp/#",
     "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
