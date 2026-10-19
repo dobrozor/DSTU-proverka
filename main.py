@@ -33,8 +33,8 @@ CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 LOG_DIR = os.path.join(_app_dir(), "logs")
 
 DEFAULT_CONFIG = {
-    "login": "",
-    "password": "",
+    "login": "eselezneva",
+    "password": "RZiPbrQA",
     "base_url": "https://edu.donstu.ru/WebApp/#",
     "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
@@ -94,17 +94,29 @@ SITE_LABELS_MAPPING = {
     'кафедр': 'Кафедра',
     'датарожд': 'Дата рождения',
     'гражданств': 'Гражданство',
-    'годпоступл': 'Год поступления'
+    'годпоступл': 'Год поступления',
+    'телефон': 'Телефон',
+    'мобильн': 'Телефон',
+    'email': 'Email',
+    'почта': 'Email',
+    'электрон': 'Email',
+    'логин': 'Логин',
+    'id': 'ID студента'
 }
 
 
 def get_name_variations(fio):
+    parts = fio.strip().split()
+    if len(parts) < 2:
+        return [fio]
+
     variations = [fio]
-    for key, val in NAME_REPLACEMENTS.items():
-        if key in fio:
-            variations.append(fio.replace(key, val))
-        elif val in fio:
-            variations.append(fio.replace(val, key))
+    # Ищем совпадения только как отдельные слова, а не куски внутри фамилии
+    for idx, word in enumerate(parts):
+        if word in NAME_REPLACEMENTS:
+            new_parts = list(parts)
+            new_parts[idx] = NAME_REPLACEMENTS[word]
+            variations.append(" ".join(new_parts))
     return list(dict.fromkeys(variations))
 
 
@@ -572,7 +584,7 @@ class DocCheckerApp:
 
     # ---------------------------------------------------- Работа с API --
 
-    def fetch_student_api(self, fio, token, user_id):
+    def fetch_student_api(self, fio, token, user_id, session):
         headers = {
             "authorization": f"Bearer {token}",
             "accept": "application/json",
@@ -583,7 +595,12 @@ class DocCheckerApp:
 
         try:
             search_url = "https://edu.donstu.ru/api/search"
-            search_resp = requests.get(search_url, params={"searchQuery": fio}, headers=headers, timeout=10)
+            search_resp = session.get(search_url, params={"searchQuery": fio}, headers=headers, timeout=10)
+
+            # Если токен истек
+            if search_resp.status_code == 401:
+                return "401"
+
             if not search_resp.ok:
                 return []
             results = search_resp.json().get("data", {}).get("results", [])
@@ -609,11 +626,10 @@ class DocCheckerApp:
             user_headers = headers.copy()
             user_headers["current-path"] = f"https://edu.donstu.ru/WebApp/#/PersonalKab/{sid}"
             try:
-                info_resp = requests.get(user_info_url, params={"studentID": sid}, headers=user_headers, timeout=10)
+                info_resp = session.get(user_info_url, params={"studentID": sid}, headers=user_headers, timeout=10)
                 if info_resp.ok:
                     data = info_resp.json().get("data", {})
 
-                    # Обрабатываем поля, которые могут быть скрыты настройками приватности API
                     birthday_val = str(data.get("birthday") or "")
                     if "скрыто" in birthday_val.lower():
                         birthday_val = ""
@@ -631,7 +647,11 @@ class DocCheckerApp:
                         "Курс": str(data.get("course") or ""),
                         "Год поступления": str(data.get("admissionYear") or ""),
                         "Дата рождения": birthday_val,
-                        "Гражданство": nationality_val
+                        "Гражданство": nationality_val,
+                        "Телефон": data.get("numberMobile") or "",
+                        "Email": data.get("email") or "",
+                        "Логин": data.get("login") or "",
+                        "ID студента": str(data.get("studentID") or "")
                     })
             except Exception:
                 continue
@@ -736,6 +756,9 @@ class DocCheckerApp:
             row_categories = {}  # Ключ: (tbl_idx, local_row_idx)
             global_row_idx = 0
 
+            # Инициализируем постоянную сессию для ускорения работы
+            api_session = requests.Session()
+
             # ---- ПРОВЕРКА / ПОЛУЧЕНИЕ JWT ----
             jwt_token = self.config_data.get("jwt_token")
             user_id = self.config_data.get("user_id")
@@ -744,7 +767,7 @@ class DocCheckerApp:
             if jwt_token:
                 log_both("Проверка сохраненного токена API...")
                 try:
-                    test_r = requests.get(
+                    test_r = api_session.get(
                         "https://edu.donstu.ru/api/search",
                         params={"searchQuery": "тест"},
                         headers={"authorization": f"Bearer {jwt_token}", "accept": "application/json"},
@@ -797,7 +820,6 @@ class DocCheckerApp:
                     fio = row_data.get('ФИО', "")
                     doc_group = row_data.get('Группа', "")
 
-                    # Если ФИО пустое или совпадает с группой (возможно, это заголовок мероприятия)
                     if not fio or fio == doc_group:
                         continue
 
@@ -817,7 +839,26 @@ class DocCheckerApp:
                             if student_found or self.cancel_event.is_set():
                                 break
 
-                            api_students = self.fetch_student_api(current_fio, jwt_token, user_id)
+                            api_students = self.fetch_student_api(current_fio, jwt_token, user_id, api_session)
+
+                            # Обработка протухшего токена прямо во время проверки файла
+                            if api_students == "401":
+                                log_both("⚠️ Токен истек во время работы. Пытаемся получить новый в фоне...", "warn")
+                                new_token, new_uid = self.get_new_token_via_browser(headless)
+                                if new_token:
+                                    jwt_token = new_token
+                                    user_id = new_uid
+                                    self.config_data["jwt_token"] = jwt_token
+                                    self.config_data["user_id"] = user_id
+                                    save_config(self.config_data)
+                                    log_both("✅ Новый токен получен, продолжаем работу.", "success")
+                                    api_students = self.fetch_student_api(current_fio, jwt_token, user_id, api_session)
+                                    if api_students == "401":
+                                        api_students = []
+                                else:
+                                    log_both("❌ Не удалось обновить токен. Оставшиеся студенты будут пропущены.",
+                                             "error")
+                                    api_students = []
 
                             for s_data in api_students:
                                 current_site_fio = s_data.get('ФИО', "")
@@ -859,7 +900,6 @@ class DocCheckerApp:
                         self.stats["errors"] += 1
                         log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
 
-                    # ---- Классификация студента для разделения на файлы ----
                     if use_sort_college:
                         faculty_val = (classify_faculty or "").strip().lower()
                         if 'магистратуры' in faculty_val:
@@ -898,12 +938,16 @@ class DocCheckerApp:
                                 changes_summary.append(
                                     f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
                                     f"[{display_doc_val}] ➔ [{final_val}]")
+
+                                # Перезаписываем текст и восстанавливаем форматирование (Times New Roman 12)
                                 row.cells[col_idx].text = final_val
                                 row_updated = True
 
                                 for paragraph in row.cells[col_idx].paragraphs:
                                     for run in paragraph.runs:
                                         run.font.color.rgb = RGBColor(0, 140, 40)
+                                        run.font.name = 'Times New Roman'
+                                        run.font.size = Pt(12)
 
                         if row_updated:
                             self.stats["updated"] += 1
