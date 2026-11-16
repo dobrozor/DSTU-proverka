@@ -17,7 +17,7 @@ from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-
+__version__ = "1.4"
 # ==============================================================================
 #  КОНФИГУРАЦИЯ
 # ==============================================================================
@@ -33,8 +33,8 @@ CONFIG_PATH = os.path.join(_app_dir(), "config.json")
 LOG_DIR = os.path.join(_app_dir(), "logs")
 
 DEFAULT_CONFIG = {
-    "login": "eselezneva",
-    "password": "RZiPbrQA",
+    "login": "",
+    "password": "",
     "base_url": "https://edu.donstu.ru/WebApp/#",
     "browser_channel": "msedge",  # msedge / chrome / chromium
     "headless": False,
@@ -111,7 +111,6 @@ def get_name_variations(fio):
         return [fio]
 
     variations = [fio]
-    # Ищем совпадения только как отдельные слова, а не куски внутри фамилии
     for idx, word in enumerate(parts):
         if word in NAME_REPLACEMENTS:
             new_parts = list(parts)
@@ -134,6 +133,59 @@ def fio_similarity(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def get_short_group_name(faculty, kafedra, default_group=""):
+    """Преобразует название факультета/кафедры в короткое обозначение по таблице."""
+    f_lower = (faculty or "").lower()
+    k_lower = (kafedra or "").lower()
+
+    # Особый случай для Авиационно-технологического колледжа ДГТУ (зависит от кафедры)
+    if "авиационно-технологический колледж" in f_lower or "авиационно-технологический колледж" in k_lower:
+        if "итхаб" in k_lower or "ithub" in k_lower:
+            return "IThub"
+        else:
+            return "АТК"
+
+    mapping_rules = [
+        ("авиастроение", "Авиастроение"),
+        ("автоматизация, мехатроника и управление", "АМиУ"),
+        ("агропромышленный", "АП"),
+        ("безопасность жизнедеятельности", "БЖиИЭ"),
+        ("инженерная экология", "БЖиИЭ"),
+        ("дорожно-транспортный", "ДТ"),
+        ("инженерно-строительный", "ИС"),
+        ("живых систем", "ИЖС"),
+        ("биоинженерия и ветеринарная медицина", "ИЖС"),
+        ("креативных индустрий", "ИКИ"),
+        ("опережающих технологий", "ШколаХ"),
+        ("школа икс", "ШколаХ"),
+        ("сквозных технологий", "Т-университет"),
+        ("физической культуры и спорта", "ИФКиС"),
+        ("информатика и вычислительная техника", "ИиВТ"),
+        ("колледж экономики управления и права", "КЭУП"),
+        ("кораблестроение и морская техника", "КиМТ"),
+        ("отдел магистратуры", "Отдел Магистратуры"),
+        ("прикладная лингвистика", "ПЛ"),
+        ("лингвистик", "ПЛ"),
+        ("промышленное и гражданское строительство", "ПГС"),
+        ("психология, педагогика и дефектология", "ППиД"),
+        ("социально-гуманитарный", "СГ"),
+        ("технология машиностроения", "ТМ"),
+        ("транспорт, сервис и эксплуатация", "TСиЭ"),
+        ("архитектуры, дизайна и искусств", "ШАДИ"),
+        ("экономика управления сервис и туризм", "ЭУСиТ"),
+        ("сервис и туризм", "ЭУСиТ"),
+        ("энергетика и нефтегазопромышленность", "ЭиНГП"),
+        ("юридический", "Юридический")
+    ]
+
+    combined_str = f"{f_lower} {k_lower}"
+    for keyword, short_name in mapping_rules:
+        if keyword in combined_str:
+            return short_name
+
+    return default_group
+
+
 # ==============================================================================
 #  ОСНОВНОЕ ПРИЛОЖЕНИЕ
 # ==============================================================================
@@ -142,8 +194,8 @@ class DocCheckerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Автоматизация проверки студентов ДГТУ")
-        self.root.geometry("700x790")
-        self.root.minsize(620, 650)
+        self.root.geometry("700x830")
+        self.root.minsize(620, 680)
         self.root.configure(padx=25, pady=20, bg="#FFFFFF")
 
         self.config_data = load_config()
@@ -191,7 +243,7 @@ class DocCheckerApp:
 
         self.lbl_subtitle = tk.Label(self.root, text="Выберите документ .docx для запуска сверки с базой данных (API)",
                                      font=("Segoe UI", 10), bg="#FFFFFF", fg="#757575")
-        self.lbl_subtitle.pack(anchor=tk.W, pady=(0, 20))
+        self.lbl_subtitle.pack(anchor=tk.W, pady=(0, 15))
 
         # --- Выбор файла ---
         self.frame_file = tk.Frame(self.root, bg="#FFFFFF")
@@ -209,7 +261,7 @@ class DocCheckerApp:
 
         # --- Опции ---
         self.frame_options = tk.Frame(self.root, bg="#FFFFFF")
-        self.frame_options.pack(fill=tk.X, pady=(12, 0))
+        self.frame_options.pack(fill=tk.X, pady=(10, 0))
 
         self.smart_group_var = tk.BooleanVar(value=False)
         self.chk_smart_group = tk.Checkbutton(
@@ -218,6 +270,14 @@ class DocCheckerApp:
             activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
         )
         self.chk_smart_group.pack(anchor=tk.W)
+
+        self.short_group_var = tk.BooleanVar(value=False)
+        self.chk_short_group = tk.Checkbutton(
+            self.frame_options, text="Вписывать сокращенные названия групп (по таблице факультетов)",
+            variable=self.short_group_var, font=("Segoe UI", 10), bg="#FFFFFF", fg="#333333",
+            activebackground="#FFFFFF", activeforeground="#333333", selectcolor="#FFFFFF"
+        )
+        self.chk_short_group.pack(anchor=tk.W)
 
         self.sort_college_var = tk.BooleanVar(value=False)
         self.chk_sort_college = tk.Checkbutton(
@@ -245,7 +305,7 @@ class DocCheckerApp:
 
         # --- Кнопки управления ---
         self.frame_buttons = tk.Frame(self.root, bg="#FFFFFF")
-        self.frame_buttons.pack(fill=tk.X, pady=15)
+        self.frame_buttons.pack(fill=tk.X, pady=12)
 
         self.btn_start = tk.Button(self.frame_buttons, text="Начать сверку", bg="#FF6F00", fg="#FFFFFF",
                                    font=("Segoe UI", 12, "bold"), command=self.start_processing, state=tk.DISABLED,
@@ -275,29 +335,24 @@ class DocCheckerApp:
         self.lbl_status.pack(anchor=tk.W)
 
         self.lbl_stats = tk.Label(self.root, text="", font=("Segoe UI", 9), bg="#FFFFFF", fg="#757575")
-        self.lbl_stats.pack(anchor=tk.W, pady=(0, 12))
+        self.lbl_stats.pack(anchor=tk.W, pady=(0, 10))
 
         # --- Лог ---
-        self.log_text = tk.Text(self.root, height=12, bg="#F9F9F9", fg="#333333", font=("Courier New", 10),
+        self.log_text = tk.Text(self.root, height=10, bg="#F9F9F9", fg="#333333", font=("Courier New", 9),
                                 relief="flat", bd=1, highlightbackground="#E0E0E0", highlightcolor="#FF6F00",
-                                highlightthickness=1, padx=10, pady=10, state=tk.DISABLED, wrap=tk.WORD)
+                                highlightthickness=1, padx=8, pady=8, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.tag_configure("error", foreground="#B00020")
         self.log_text.tag_configure("warn", foreground="#E65C00")
         self.log_text.tag_configure("success", foreground="#1B8A2F")
         self.log_text.tag_configure("muted", foreground="#9E9E9E")
 
-        info_text = (
-            "• Автоматизированная проверка по списку студентов ДГТУ. Требуется аккаунт с правами доступа к поиску студентов на едушке.\n"
-            "• Для подробной информации советую прочитать 'Справка' вверху программы\n"
-            "\n"
-            "• Скрипт создан с любовью к вашему личному времени.\n"
-        )
+        info_text = "• Скрипт автоматизированной сверки и заполнения данных студентов ДГТУ."
         self.lbl_info = tk.Label(self.root, text=info_text, justify=tk.LEFT, bg="#FFFFFF", fg="#757575",
                                  font=("Segoe UI", 9), anchor=tk.W)
-        self.lbl_info.pack(fill=tk.X, pady=(15, 0))
+        self.lbl_info.pack(fill=tk.X, pady=(10, 0))
 
-    # ---------------------------------------------------------- Настройки --
+    # ------------------------------------------------------------ Настройки --
 
     def open_settings(self):
         win = tk.Toplevel(self.root)
@@ -362,32 +417,16 @@ class DocCheckerApp:
             "Автоматизация проверки студентов ДГТУ\n\n"
             "Программа сверяет данные из Word-документа с базой edu.donstu.ru и "
             "автоматически дозаполняет пустые ячейки.\n\n"
-            "КАК ДОЛЖНЫ НАЗЫВАТЬСЯ КОЛОНКИ В WORD:\n"
-            "Скрипт ищет колонки по ключевым словам. Регистр букв, пробелы и точки игнорируются, "
-            "поэтому точное совпадение не требуется (главное — наличие корня слова):\n\n"
-            "• ФИО (обязательно) — ищет по «ФИО» или «Ф.И.О.»\n"
-            "• Группа — ищет группу студента (В шапке: Группа, Группы)\n"
-            "• Курс — ищет по курсу студента\n"
-            "• Номер зачетной книжки — ищет номер зачетки\n"
-            "• Факультет — ищет по «факультету»\n"
-            "• Кафедра — ищет по «кафедре»\n"
-            "• Дата рождения — ищет по «датарожд» (например: Дата рождения)\n"
-            "• Год поступления — ищет по «годпоступл» (например: Год поступления)\n"
-            "• Гражданство — ищет по «гражданств»\n\n"
-            "КАКИЕ ДАННЫЕ ПАРСЯТСЯ ИЗ API:\n"
-            "Из карточки студента извлекаются: ФИО, номер зачетки, группа, "
-            "кафедра, факультет, курс, год поступления, дата рождения и гражданство (национальность). "
-            "Если данные (например, дата рождения) скрыты настройками приватности профиля, "
-            "скрипт корректно их пропустит и оставит ячейку пустой.\n\n"
-            "СОРТИРОВКА МАГИСТРАТУРА/КОЛЛЕДЖ:\n"
-            "Если включена галочка «Сортировать магистратура и колледж», по завершении проверки "
-            "итоговая таблица будет разбита на 3 отдельные таблицы (по данным факультета, "
-            "полученным с сайта):\n"
-            "1. Магистратура — факультет содержит «магистратура»\n"
-            "2. Колледжи — факультет содержит «колледж»\n"
-            "3. Остальные студенты — все прочие (включая ненайденных)"
+            "НОВОЕ:\n"
+            "Галочка «Вписывать сокращенные названия групп» автоматически заменяет или заполняет "
+            "группу сокращенным названием факультета/института согласно утвержденному справочнику "
+            "(например: АМиУ, АП, ИС, ШколаХ, Т-университет, АТК, IThub и др.).\n\n"
+            "КАК ДОЛЖНЫ НАЗЫВАТЬСЯ КОЛОНКИ В WORD:\n\n"
+            "ФИО, Группа, Номер зачетной книжки, Факультет, Кафедра, Курс, Год поступления, Дата рождения, Гражданство, Телефон, Email, Логин, ID студента\n"
+            "\n"
+            f"v. {version}"
         )
-        messagebox.showinfo("О программе и форматах колонок", about_text)
+        messagebox.showinfo("О программе и справка", about_text)
 
     # ------------------------------------------------------------ Работа --
 
@@ -553,6 +592,7 @@ class DocCheckerApp:
         self.btn_stop.config(state=tk.NORMAL)
 
         use_smart_group = self.smart_group_var.get()
+        use_short_group = self.short_group_var.get()
         use_sort_college = self.sort_college_var.get()
         headless = self.headless_var.get()
         self.config_data["headless"] = headless
@@ -574,7 +614,8 @@ class DocCheckerApp:
         self.update_status("Инициализация...", 0)
 
         threading.Thread(target=self.process_file_worker,
-                         args=(self.file_path, use_smart_group, headless, use_sort_college), daemon=True).start()
+                         args=(self.file_path, use_smart_group, headless, use_sort_college, use_short_group),
+                         daemon=True).start()
 
     def stop_processing(self):
         if self.is_running:
@@ -597,7 +638,6 @@ class DocCheckerApp:
             search_url = "https://edu.donstu.ru/api/search"
             search_resp = session.get(search_url, params={"searchQuery": fio}, headers=headers, timeout=10)
 
-            # Если токен истек
             if search_resp.status_code == 401:
                 return "401"
 
@@ -698,7 +738,6 @@ class DocCheckerApp:
                 search_input = page.locator("input[placeholder='Поиск']")
                 search_input.wait_for(state="visible", timeout=15000)
 
-                # Делаем фиктивный ввод, чтобы гарантированно триггернуть API запрос поиска
                 if not extracted_token:
                     search_input.fill("т")
                     page.wait_for_timeout(2000)
@@ -709,7 +748,7 @@ class DocCheckerApp:
 
         return extracted_token, extracted_user_id
 
-    def process_file_worker(self, file_path, use_smart_group, headless, use_sort_college=False):
+    def process_file_worker(self, file_path, use_smart_group, headless, use_sort_college=False, use_short_group=False):
         os.makedirs(LOG_DIR, exist_ok=True)
         log_file_path = os.path.join(LOG_DIR, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         log_lines = []
@@ -726,7 +765,6 @@ class DocCheckerApp:
                 self.msg_queue.put({"type": "error", "text": "В документе не найдены таблицы."})
                 return
 
-            # СБОР ВСЕХ ТАБЛИЦ С ФИО
             target_tables_info = []
             for tbl_idx, tbl in enumerate(doc.tables):
                 if len(tbl.rows) == 0:
@@ -753,13 +791,11 @@ class DocCheckerApp:
             log_both(f"Найдено таблиц для обработки: {len(target_tables_info)}. Всего студентов: {total_rows}")
 
             changes_summary = []
-            row_categories = {}  # Ключ: (tbl_idx, local_row_idx)
+            row_categories = {}
             global_row_idx = 0
 
-            # Инициализируем постоянную сессию для ускорения работы
             api_session = requests.Session()
 
-            # ---- ПРОВЕРКА / ПОЛУЧЕНИЕ JWT ----
             jwt_token = self.config_data.get("jwt_token")
             user_id = self.config_data.get("user_id")
             token_valid = False
@@ -798,7 +834,6 @@ class DocCheckerApp:
                     self.msg_queue.put({"type": "error", "text": f"Ошибка авторизации: {e}"})
                     return
 
-            # ---- ОСНОВНОЙ ЦИКЛ ПО ТАБЛИЦАМ ----
             for tbl_idx, tbl, doc_columns in target_tables_info:
                 if cancelled:
                     break
@@ -841,7 +876,6 @@ class DocCheckerApp:
 
                             api_students = self.fetch_student_api(current_fio, jwt_token, user_id, api_session)
 
-                            # Обработка протухшего токена прямо во время проверки файла
                             if api_students == "401":
                                 log_both("⚠️ Токен истек во время работы. Пытаемся получить новый в фоне...", "warn")
                                 new_token, new_uid = self.get_new_token_via_browser(headless)
@@ -867,7 +901,6 @@ class DocCheckerApp:
 
                                 sim = fio_similarity(fio, current_site_fio)
                                 if sim < self.config_data.get("fio_similarity_threshold", 0.55):
-                                    log_both(f"  [!] Пропуск: {current_site_fio}. Схожесть ({sim:.2f}).", "warn")
                                     continue
 
                                 site_group = s_data.get('Группа', "")
@@ -884,21 +917,27 @@ class DocCheckerApp:
                                 if is_match and site_group:
                                     student_found = True
                                     classify_faculty = s_data.get('Факультет') or classify_faculty
+
                                     for label in doc_columns.keys():
                                         val = s_data.get(label)
+
+                                        # Если включено сокращение и колонка Группа или Факультет
+                                        if use_short_group and label in ['Группа', 'Факультет']:
+                                            val = get_short_group_name(
+                                                s_data.get('Факультет'),
+                                                s_data.get('Кафедра'),
+                                                val
+                                            )
+
                                         if val and val not in aggregated_site_data[label]:
                                             aggregated_site_data[label].append(val)
-                                else:
-                                    disp_group = site_group if site_group else "Отсутствует"
-                                    log_both(f"  [!] Пропуск: {current_site_fio}. Группа [{disp_group}] не подошла.",
-                                             "muted")
 
                         if student_found:
                             self.stats["found"] += 1
 
                     except Exception as e:
                         self.stats["errors"] += 1
-                        log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}. Идём дальше.", "error")
+                        log_both(f"⚠️ Непредвиденная ошибка при обработке '{fio}': {e}", "error")
 
                     if use_sort_college:
                         faculty_val = (classify_faculty or "").strip().lower()
@@ -911,7 +950,7 @@ class DocCheckerApp:
 
                     if not student_found:
                         self.stats["not_found"] += 1
-                        log_both(f"❌ Подходящие варианты для '{fio}' не найдены. Выделяем красным.", "error")
+                        log_both(f"❌ Подходящие варианты для '{fio}' не найдены.", "error")
                         fio_cell = row.cells[doc_columns['ФИО']]
                         for paragraph in fio_cell.paragraphs:
                             for run in paragraph.runs:
@@ -939,7 +978,6 @@ class DocCheckerApp:
                                     f"{aggregated_site_data.get('ФИО', [fio])[0]}: {label} "
                                     f"[{display_doc_val}] ➔ [{final_val}]")
 
-                                # Перезаписываем текст и восстанавливаем форматирование (Times New Roman 12)
                                 row.cells[col_idx].text = final_val
                                 row_updated = True
 
@@ -958,7 +996,6 @@ class DocCheckerApp:
 
                     self.update_stats()
 
-            # ---- ФИНАЛЬНОЕ СОХРАНЕНИЕ / РАЗБИВКА НА 3 ФАЙЛА ----
             name, ext = os.path.splitext(file_path)
 
             if not use_sort_college:
@@ -969,7 +1006,6 @@ class DocCheckerApp:
                     {"type": "done", "path": updated_file_path, "changes": changes_summary, "cancelled": cancelled})
             else:
                 log_both("Создание трех отдельных файлов (Магистратура, Колледжи, Остальные)...")
-
                 base_temp_path = f"{name}_temp_base{ext}"
                 doc.save(base_temp_path)
 
@@ -984,8 +1020,6 @@ class DocCheckerApp:
                 for cat_key, cat_name in categories_files:
                     try:
                         cat_doc = Document(base_temp_path)
-
-                        # Проходимся по всем собранным таблицам и чистим лишние строки
                         for tbl_idx, _, _ in target_tables_info:
                             cat_table = cat_doc.tables[tbl_idx]
                             rows_to_remove = []
@@ -1013,11 +1047,7 @@ class DocCheckerApp:
                 except Exception:
                     pass
 
-                if cancelled:
-                    log_both("⏹ Проверка остановлена. Файлы сохранены с уже внесёнными изменениями.", "warn")
-                else:
-                    log_both("✅ Проверка завершена! Файлы успешно разбиты.", "success")
-
+                log_both("✅ Проверка завершена! Файлы успешно разбиты.", "success")
                 self.msg_queue.put(
                     {"type": "done", "path": first_saved_path, "changes": changes_summary, "cancelled": cancelled})
 
@@ -1029,6 +1059,7 @@ class DocCheckerApp:
                     f.write("\n".join(log_lines))
             except Exception:
                 pass
+
 
 if __name__ == '__main__':
     root = tk.Tk()
